@@ -1,3 +1,4 @@
+import os
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -5,6 +6,20 @@ import random
 import typing
 import re
 import datetime
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+Thread(target=run_flask).start()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -16,11 +31,11 @@ OWNER_ID = 1160627021865549976
 
 # ---------- DATA STORES (in memory) ----------
 
-giveaways = {}          # message_id -> giveaway dict
-authorized_roles = {}   # guild_id -> set(role_ids) can host
-blacklisted_roles = {}  # guild_id -> set(role_ids) globally banned from joining
-entry_channels = {}     # guild_id -> set(channel_ids) where messages count
-multiplier_roles = {}   # guild_id -> {role_id: multiplier_number}
+giveaways = {}
+authorized_roles = {}
+blacklisted_roles = {}
+entry_channels = {}
+multiplier_roles = {}
 
 
 def can_manage_giveaways(member: discord.Member):
@@ -65,10 +80,9 @@ def get_multiplier(guild_id, member):
 
 
 def parse_duration(text: str):
-    """Parses '1h', '30m', '2d', '1h30m' etc into total seconds. Returns None if invalid."""
     text = text.strip().lower()
     if text.isdigit():
-        return int(text) * 60  # bare number = minutes, for backward compatibility
+        return int(text) * 60
 
     pattern = r"(\d+)\s*(d|h|m|s)"
     matches = re.findall(pattern, text)
@@ -157,8 +171,6 @@ async def on_ready():
     except Exception as e:
         print(f"Slash command sync failed: {e}")
 
-
-# ---------- SETUP COMMAND ----------
 
 @bot.tree.command(name="setup", description="Admin: configure giveaway roles, channels, and multipliers")
 @app_commands.describe(
@@ -252,8 +264,6 @@ async def setup_cmd(
         embed.add_field(name="Multiplier roles", value=mults_txt, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-
-# ---------- GIVEAWAY COMMANDS ----------
 
 @bot.hybrid_command(name="gstart", description="Start a giveaway")
 @app_commands.describe(
@@ -355,7 +365,6 @@ async def end_giveaway(giveaway_id):
         await channel.send(embed=embed)
         return
 
-    # weighted random pick, without repeating the same winner twice
     pool = list(gw["entries"])
     chosen = []
     num_winners = min(gw["winners"], len(set(pool)))
@@ -415,8 +424,6 @@ async def gremove(ctx, message_id: str, member: discord.Member):
     await ctx.send(f"Removed {member.mention} from that giveaway.")
 
 
-# ---------- MESSAGE HANDLING ----------
-
 @bot.event
 async def on_message(message):
     try:
@@ -449,5 +456,4 @@ async def on_message(message):
         print(f"on_message error: {e}")
 
 
-import os
 bot.run(os.environ["DISCORD_TOKEN"])
