@@ -169,11 +169,36 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             print(f"Failed to send log: {e}", flush=True)
 
 
+def join_limited(items, sep=", ", limit=1000):
+    """Joins text pieces but stops before hitting Discord's embed field size limit."""
+    out = ""
+    for i, item in enumerate(items):
+        piece = item if not out else sep + item
+        if len(out) + len(piece) > limit:
+            out += f"{sep}…and {len(items) - i} more"
+            break
+        out += piece
+    return out or "None"
+
+
+async def refresh_giveaway_posts(guild_id):
+    """Re-draws every running giveaway post in a server (used when /setup changes blacklist or bonus roles)."""
+    for gid, gw in list(giveaways.items()):
+        if gw["guild_id"] != guild_id or not gw["active"]:
+            continue
+        try:
+            channel = bot.get_channel(gw["channel_id"])
+            post = await channel.fetch_message(gid)
+            await post.edit(embed=build_giveaway_embed(gw, gid))
+        except Exception as e:
+            print(f"Failed to refresh giveaway post {gid}: {e}", flush=True)
+
+
 def build_giveaway_embed(gw, giveaway_id=None):
     """Builds the giveaway post from the stored giveaway data (used when starting AND editing)."""
     embed = discord.Embed(
         title=f"{EMOJI['party']}  G I V E A W A Y  {EMOJI['party']}",
-        description=f"{EMOJI['sparkle']} **{gw['prize']}** {EMOJI['sparkle']}\n\nClick **Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n*Click Join again anytime to leave.*",
+        description=f"{EMOJI['sparkle']} **{gw['prize']}** {EMOJI['sparkle']}\n\nClick **Join Giveaway** below to enter — you get **1 entry** instantly! Then chat in the allowed channel(s): every message earns you another entry.\n*Click Join again anytime to leave (your entries are removed).*",
         color=get_guild_color(gw["guild_id"])
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
@@ -182,15 +207,22 @@ def build_giveaway_embed(gw, giveaway_id=None):
     embed.add_field(name=f"{EMOJI['trophy']} Winners", value=str(gw["winners"]), inline=True)
     if gw["required_role_id"]:
         embed.add_field(name="🔑 Required role", value=f"<@&{gw['required_role_id']}>", inline=True)
-    if gw["blacklist_role_id"]:
-        embed.add_field(name="🚫 Blacklisted role", value=f"<@&{gw['blacklist_role_id']}>", inline=True)
+    blocked_ids = list(blacklisted_roles.get(gw["guild_id"], set()))
+    if gw["blacklist_role_id"] and gw["blacklist_role_id"] not in blocked_ids:
+        blocked_ids.append(gw["blacklist_role_id"])
+    if blocked_ids:
+        embed.add_field(
+            name="🚫 Blacklisted roles (can't join)",
+            value=join_limited([f"<@&{rid}>" for rid in blocked_ids]),
+            inline=False
+        )
     if gw["bypass_role_id"]:
         embed.add_field(name="⚡ Bypass role", value=f"<@&{gw['bypass_role_id']}>", inline=True)
 
     guild_mults = multiplier_roles.get(gw["guild_id"], {})
     if guild_mults:
-        mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
-        embed.add_field(name="⭐ Bonus entry roles", value=mults_text, inline=False)
+        mults_text = join_limited([f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items()], sep="\n")
+        embed.add_field(name="⭐ Bonus entry roles (extra entries)", value=mults_text, inline=False)
 
     if gw.get("image_url"):
         embed.set_image(url=gw["image_url"])
@@ -221,7 +253,11 @@ class GiveawayView(discord.ui.View):
 
             if user.id in gw["joined_users"]:
                 gw["joined_users"].discard(user.id)
-                await interaction.response.send_message("You left the giveaway. 👋", ephemeral=True)
+                gw["entries"] = [uid for uid in gw["entries"] if uid != user.id]
+                await interaction.response.send_message(
+                    "You left the giveaway and your entries were removed. 👋 Click again to rejoin — you'll start over with your starting entry.",
+                    ephemeral=True
+                )
                 return
 
             if not bypass:
@@ -238,8 +274,12 @@ class GiveawayView(discord.ui.View):
                         return
 
             gw["joined_users"].add(user.id)
+            starting_entries = get_multiplier(interaction.guild.id, user)
+            gw["entries"].extend([user.id] * starting_entries)
+            entry_word = "entry" if starting_entries == 1 else "entries"
             await interaction.response.send_message(
-                "✅ You joined! Send messages in the allowed channel(s) to rack up entries. Click again to leave.",
+                f"✅ You joined and got **{starting_entries}** {entry_word} right away! "
+                "Send messages in the allowed channel(s) to earn more. Click again to leave.",
                 ephemeral=True
             )
         except Exception as e:
@@ -356,8 +396,8 @@ async def help_cmd(ctx):
     app_commands.Choice(name="🔕 Stop a channel's messages from counting", value="remove_channel"),
     app_commands.Choice(name="⭐ Give a role bonus entries (multiplier)", value="add_multiplier"),
     app_commands.Choice(name="✖️ Remove a role's bonus entries", value="remove_multiplier"),
-    app_commands.Choice(name="📣 Set a default role to ping on new giveaways", value="set_ping_role"),
-    app_commands.Choice(name="🔇 Remove the default ping role", value="remove_ping_role"),
+    app_commands.Choice(name="📣 Set the role to ping on new giveaways", value="set_ping_role"),
+    app_commands.Choice(name="🔇 Remove the giveaway ping role", value="remove_ping_role"),
     app_commands.Choice(name="🎨 Set a custom embed color", value="set_embed_color"),
     app_commands.Choice(name="🎨 Reset embed color to default", value="reset_embed_color"),
     app_commands.Choice(name="📝 Set the log channel", value="set_log_channel"),
@@ -442,7 +482,7 @@ async def setup_cmd(
 
     elif act == "remove_ping_role":
         default_ping_roles.pop(guild_id, None)
-        await interaction.response.send_message("❌ Default ping role removed.", ephemeral=True)
+        await interaction.response.send_message("❌ Giveaway ping role removed. New giveaways won't ping anyone.", ephemeral=True)
 
     elif act == "set_embed_color":
         hex_clean = color if color.startswith("#") else f"#{color}"
@@ -484,10 +524,13 @@ async def setup_cmd(
         embed.add_field(name="Blocked from joining", value=banned_txt, inline=False)
         embed.add_field(name="Channels that count entries", value=chans_txt, inline=False)
         embed.add_field(name="Bonus entry roles", value=mults_txt, inline=False)
-        embed.add_field(name="Default ping role", value=ping_txt, inline=True)
+        embed.add_field(name="Giveaway ping role", value=ping_txt, inline=True)
         embed.add_field(name="Embed color", value=color_hex, inline=True)
         embed.add_field(name="Log channel", value=log_txt, inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    if act in ("blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier"):
+        await refresh_giveaway_posts(guild_id)
 
 
 # ---------- CUSTOM EMBED COMMAND ----------
@@ -569,8 +612,7 @@ async def embed_cmd(
     required_role="Only members with this role are allowed to join",
     blacklist_role="Members with this role are blocked from joining (this giveaway only)",
     bypass_role="Members with this role skip the required role and blacklist checks",
-    image_url="A direct image link to display in the giveaway post",
-    ping_role="A role to mention (overrides the server's default ping role, if any set in /setup)"
+    image_url="A direct image link to display in the giveaway post"
 )
 async def start_giveaway(
     ctx,
@@ -581,7 +623,6 @@ async def start_giveaway(
     blacklist_role: typing.Optional[discord.Role] = None,
     bypass_role: typing.Optional[discord.Role] = None,
     image_url: typing.Optional[str] = None,
-    ping_role: typing.Optional[discord.Role] = None,
 ):
     if not can_manage_giveaways(ctx.author):
         await ctx.send("You don't have permission to start giveaways.")
@@ -629,7 +670,8 @@ async def start_giveaway(
         "wake": asyncio.Event(),
     }
 
-    final_ping_role = ping_role or (ctx.guild.get_role(default_ping_roles[ctx.guild.id]) if ctx.guild.id in default_ping_roles else None)
+    ping_role_id = default_ping_roles.get(ctx.guild.id)
+    final_ping_role = ctx.guild.get_role(ping_role_id) if ping_role_id else None
     content = final_ping_role.mention if final_ping_role else None
 
     msg = await ctx.send(content=content, embed=build_giveaway_embed(gw))
