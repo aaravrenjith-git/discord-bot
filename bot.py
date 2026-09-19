@@ -55,7 +55,6 @@ OWNER_REPLIES = [
 # (Emojis show up in titles, descriptions, field text and buttons, but not in embed footers.)
 EMOJI = {
     "party": "🎉",     # giveaway titles + Join button
-    "sparkle": "✨",   # around the prize
     "host": "🎤",      # "Hosted by"
     "clock": "⏰",     # "Ends"
     "trophy": "🏆",    # winners
@@ -198,7 +197,7 @@ def build_giveaway_embed(gw, giveaway_id=None):
     """Builds the giveaway post from the stored giveaway data (used when starting AND editing)."""
     embed = discord.Embed(
         title=f"{EMOJI['party']}  G I V E A W A Y  {EMOJI['party']}",
-        description=f"{EMOJI['sparkle']} **{gw['prize']}** {EMOJI['sparkle']}\n\nClick **Join Giveaway** below to enter — you get **1 entry** instantly! Then chat in the allowed channel(s): every message earns you another entry.\n*Click Join again anytime to leave (your entries are removed).*",
+        description=f"**Prize -** {gw['prize']}\n\nClick **Join Giveaway** below to enter — you get **1 entry** instantly! Then chat in the allowed channel(s): every message earns you another entry.\n*Click Join again anytime to leave (your entries are removed).*\n\n⚠️ **Spamming can get you blacklisted from giveaways.**",
         color=get_guild_color(gw["guild_id"])
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
