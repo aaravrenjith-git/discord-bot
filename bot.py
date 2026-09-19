@@ -1,4 +1,5 @@
 import os
+import time
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,21 +14,26 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive!"
+    return "ChillBot is alive! 😎"
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    try:
+        port = int(os.environ.get("PORT", 8080))
+        print(f"Starting Flask on port {port}", flush=True)
+        app.run(host='0.0.0.0', port=port)
+    except Exception as e:
+        print(f"FLASK CRASHED: {e}", flush=True)
 
-Thread(target=run_flask).start()
+Thread(target=run_flask, daemon=True).start()
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="?", intents=intents)
+bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
 
 OWNER_ID = 1160627021865549976
+BRAND_COLOR = discord.Color.from_str("#5865F2")
 
 # ---------- DATA STORES (in memory) ----------
 
@@ -36,10 +42,21 @@ authorized_roles = {}
 blacklisted_roles = {}
 entry_channels = {}
 multiplier_roles = {}
+win_counts = {}
+last_message_time = {}
+MESSAGE_COOLDOWN_SECONDS = 5
+
+
+def is_admin_or_owner(member: discord.Member):
+    if member.guild_permissions.administrator:
+        return True
+    if member.guild.owner_id == member.id:
+        return True
+    return False
 
 
 def can_manage_giveaways(member: discord.Member):
-    if member.guild_permissions.administrator:
+    if is_admin_or_owner(member):
         return True
     allowed = authorized_roles.get(member.guild.id, set())
     user_role_ids = {r.id for r in member.roles}
@@ -79,6 +96,11 @@ def get_multiplier(guild_id, member):
     return best
 
 
+def record_win(guild_id, user_id):
+    guild_wins = win_counts.setdefault(guild_id, {})
+    guild_wins[user_id] = guild_wins.get(user_id, 0) + 1
+
+
 def parse_duration(text: str):
     text = text.strip().lower()
     if text.isdigit():
@@ -115,12 +137,12 @@ class GiveawayView(discord.ui.View):
 
             if user.id in gw["joined_users"]:
                 gw["joined_users"].discard(user.id)
-                await interaction.response.send_message("You left the giveaway.", ephemeral=True)
+                await interaction.response.send_message("You left the giveaway. 👋", ephemeral=True)
                 return
 
             if not bypass:
                 if is_blacklisted(interaction.guild.id, user, gw["blacklist_role_id"]):
-                    await interaction.response.send_message("You're not allowed to join this giveaway.", ephemeral=True)
+                    await interaction.response.send_message("🚫 You're not allowed to join this giveaway.", ephemeral=True)
                     return
 
                 if gw["required_role_id"]:
@@ -133,11 +155,11 @@ class GiveawayView(discord.ui.View):
 
             gw["joined_users"].add(user.id)
             await interaction.response.send_message(
-                "You joined! Send messages in the allowed channel(s) to rack up entries. Click again to leave. 🎉",
+                "✅ You joined! Send messages in the allowed channel(s) to rack up entries. Click again to leave.",
                 ephemeral=True
             )
         except Exception as e:
-            print(f"Join button error: {e}")
+            print(f"Join button error: {e}", flush=True)
             if not interaction.response.is_done():
                 await interaction.response.send_message("Something went wrong, try again.", ephemeral=True)
 
@@ -155,49 +177,105 @@ class GiveawayView(discord.ui.View):
                 lines.append(f"<@{uid}> — **{count}** entr{'y' if count == 1 else 'ies'}")
 
             text = f"**Participants ({len(gw['joined_users'])}):**\n" + "\n".join(lines)
+            if len(text) > 1900:
+                text = text[:1900] + "\n...(list truncated)"
             await interaction.response.send_message(text, ephemeral=True)
         except Exception as e:
-            print(f"Participants button error: {e}")
+            print(f"Participants button error: {e}", flush=True)
             if not interaction.response.is_done():
                 await interaction.response.send_message("Something went wrong, try again.", ephemeral=True)
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    print(f"Logged in as {bot.user}", flush=True)
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for /start-giveaway 🎉"))
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        print(f"Synced {len(synced)} slash command(s)", flush=True)
     except Exception as e:
-        print(f"Slash command sync failed: {e}")
+        print(f"Slash command sync failed: {e}", flush=True)
 
 
-@bot.tree.command(name="setup", description="Admin: configure giveaway roles, channels, and multipliers")
+@bot.event
+async def on_command_error(ctx, error):
+    print(f"Command error: {error}", flush=True)
+    try:
+        await ctx.send("Something went wrong running that command.")
+    except Exception:
+        pass
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    print(f"Slash command error: {error}", flush=True)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong running that command.", ephemeral=True)
+    except Exception:
+        pass
+
+
+# ---------- HELP COMMAND ----------
+
+@bot.hybrid_command(name="help", description="Show all ChillBot commands and what they do")
+async def help_cmd(ctx):
+    embed = discord.Embed(
+        title="😎 ChillBot — Help",
+        description="Your all-in-one giveaway bot. Here's everything you can do:",
+        color=BRAND_COLOR
+    )
+    embed.add_field(
+        name="🎉 Giveaway Commands (Admins or authorized roles)",
+        value=(
+            "**/start-giveaway** — Create a new giveaway with a join button\n"
+            "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
+            "**/remove-participant** — Kick someone out of a giveaway\n"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🏆 Everyone",
+        value="**/leaderboard** — See who's won the most giveaways in this server",
+        inline=False
+    )
+    embed.add_field(
+        name="⚙️ Admin Only",
+        value="**/setup** — Set host roles, blacklist roles, allowed channels, and bonus entry multipliers",
+        inline=False
+    )
+    embed.set_footer(text="Owner: Aarav • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+# ---------- SETUP COMMAND (renamed: giveaway-settings) ----------
+
+@bot.tree.command(name="setup", description="[Admin] Configure who can host giveaways, blacklists, channels, and entry bonuses")
 @app_commands.describe(
-    action="What setting to change",
-    role="Role to use (for role-related actions)",
-    channel="Channel to use (for channel-related actions)",
-    multiplier="Entry multiplier, e.g. 2 for 2x entries (only for multiplier actions)"
+    action="Which setting do you want to change?",
+    role="The role to apply this action to (needed for role-based actions)",
+    channel="The channel to apply this action to (needed for channel-based actions)",
+    multiplier="How many entries per message this role should get, e.g. 2 for double entries"
 )
 @app_commands.choices(action=[
-    app_commands.Choice(name="Add authorized host role", value="add_role"),
-    app_commands.Choice(name="Remove authorized host role", value="remove_role"),
-    app_commands.Choice(name="Blacklist a role from joining (global)", value="blacklist_role"),
-    app_commands.Choice(name="Remove role from blacklist", value="unblacklist_role"),
-    app_commands.Choice(name="Add channel that counts entries", value="add_channel"),
-    app_commands.Choice(name="Remove channel from counting", value="remove_channel"),
-    app_commands.Choice(name="Set a role's entry multiplier", value="add_multiplier"),
-    app_commands.Choice(name="Remove a role's entry multiplier", value="remove_multiplier"),
-    app_commands.Choice(name="Show current settings", value="show"),
+    app_commands.Choice(name="➕ Allow a role to host giveaways", value="add_role"),
+    app_commands.Choice(name="➖ Remove a role's hosting permission", value="remove_role"),
+    app_commands.Choice(name="🚫 Block a role from joining giveaways", value="blacklist_role"),
+    app_commands.Choice(name="✅ Unblock a role from joining giveaways", value="unblacklist_role"),
+    app_commands.Choice(name="📢 Let messages in a channel count as entries", value="add_channel"),
+    app_commands.Choice(name="🔕 Stop a channel's messages from counting", value="remove_channel"),
+    app_commands.Choice(name="⭐ Give a role bonus entries (multiplier)", value="add_multiplier"),
+    app_commands.Choice(name="✖️ Remove a role's bonus entries", value="remove_multiplier"),
+    app_commands.Choice(name="📋 Show all current giveaway settings", value="show"),
 ])
-async def setup_cmd(
+async def giveaway_settings_cmd(
     interaction: discord.Interaction,
     action: app_commands.Choice[str],
     role: typing.Optional[discord.Role] = None,
     channel: typing.Optional[discord.TextChannel] = None,
     multiplier: typing.Optional[int] = None,
 ):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_or_owner(interaction.user):
         await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
         return
 
@@ -210,9 +288,13 @@ async def setup_cmd(
     if act in ("add_channel", "remove_channel") and not channel:
         await interaction.response.send_message("Please pick a channel for this action.", ephemeral=True)
         return
-    if act == "add_multiplier" and not multiplier:
-        await interaction.response.send_message("Please provide a multiplier number, e.g. 2.", ephemeral=True)
-        return
+    if act == "add_multiplier":
+        if not multiplier:
+            await interaction.response.send_message("Please provide a multiplier number, e.g. 2.", ephemeral=True)
+            return
+        if multiplier < 1 or multiplier > 20:
+            await interaction.response.send_message("Multiplier must be between 1 and 20.", ephemeral=True)
+            return
 
     if act == "add_role":
         authorized_roles.setdefault(guild_id, set()).add(role.id)
@@ -257,24 +339,28 @@ async def setup_cmd(
         chans_txt = ", ".join(f"<#{c}>" for c in chans) or "Default (each giveaway's own channel)"
         mults_txt = ", ".join(f"<@&{r}> ({m}x)" for r, m in mults.items()) or "None"
 
-        embed = discord.Embed(title="⚙️ Giveaway Setup", color=discord.Color.blurple())
-        embed.add_field(name="Authorized host roles", value=roles_txt, inline=False)
-        embed.add_field(name="Blacklisted roles", value=banned_txt, inline=False)
-        embed.add_field(name="Entry-counting channels", value=chans_txt, inline=False)
-        embed.add_field(name="Multiplier roles", value=mults_txt, inline=False)
+        embed = discord.Embed(title="⚙️ Giveaway Settings", color=BRAND_COLOR)
+        embed.add_field(name="Who can host giveaways", value=roles_txt, inline=False)
+        embed.add_field(name="Blocked from joining", value=banned_txt, inline=False)
+        embed.add_field(name="Channels that count entries", value=chans_txt, inline=False)
+        embed.add_field(name="Bonus entry roles", value=mults_txt, inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.hybrid_command(name="gstart", description="Start a giveaway")
+# ---------- GIVEAWAY COMMANDS ----------
+
+@bot.hybrid_command(name="start-giveaway", description="Create a new giveaway with a join button")
 @app_commands.describe(
-    duration="e.g. 30m, 1h, 2d, 1h30m",
-    prize="What's being given away",
-    winners="How many winners (default 1)",
-    required_role="Only members with this role can join",
-    blacklist_role="Members with this role cannot join (this giveaway only)",
-    bypass_role="Members with this role skip required_role and blacklist checks"
+    duration="How long the giveaway runs, e.g. 30m, 1h, 2d, 1h30m",
+    prize="What you're giving away",
+    winners="Number of winners to pick (default: 1)",
+    required_role="Only members with this role are allowed to join",
+    blacklist_role="Members with this role are blocked from joining (this giveaway only)",
+    bypass_role="Members with this role skip the required role and blacklist checks",
+    image_url="A direct image link to display in the giveaway post",
+    ping_role="A role to mention when the giveaway is posted"
 )
-async def gstart(
+async def start_giveaway(
     ctx,
     duration: str,
     prize: str,
@@ -282,18 +368,34 @@ async def gstart(
     required_role: typing.Optional[discord.Role] = None,
     blacklist_role: typing.Optional[discord.Role] = None,
     bypass_role: typing.Optional[discord.Role] = None,
+    image_url: typing.Optional[str] = None,
+    ping_role: typing.Optional[discord.Role] = None,
 ):
     if not can_manage_giveaways(ctx.author):
         await ctx.send("You don't have permission to start giveaways.")
+        return
+
+    if len(prize) > 200:
+        await ctx.send("Prize text is too long (max 200 characters).")
         return
 
     seconds = parse_duration(duration)
     if seconds is None:
         await ctx.send("Invalid duration. Use formats like `30m`, `1h`, `2d`, or `1h30m`.")
         return
+    if seconds > 30 * 86400:
+        await ctx.send("Duration can't be longer than 30 days.")
+        return
 
     if winners < 1:
         winners = 1
+    if winners > 20:
+        await ctx.send("Max 20 winners per giveaway.")
+        return
+
+    if image_url and not re.match(r"^https?://\S+\.(png|jpg|jpeg|gif|webp)$", image_url, re.IGNORECASE):
+        await ctx.send("Image URL must be a direct link ending in .png, .jpg, .jpeg, .gif, or .webp.")
+        return
 
     end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
     timestamp = discord.utils.format_dt(end_time, style="R")
@@ -318,9 +420,13 @@ async def gstart(
         mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
         embed.add_field(name="Bonus entry roles", value=mults_text, inline=False)
 
-    embed.set_footer(text="Starting...")
+    if image_url:
+        embed.set_image(url=image_url)
 
-    msg = await ctx.send(embed=embed)
+    embed.set_footer(text="Starting... • ChillBot 😎")
+
+    content = ping_role.mention if ping_role else None
+    msg = await ctx.send(content=content, embed=embed)
     view = GiveawayView(msg.id)
 
     giveaways[msg.id] = {
@@ -337,7 +443,7 @@ async def gstart(
         "active": True,
     }
 
-    embed.set_footer(text=f"Giveaway ID: {msg.id}")
+    embed.set_footer(text=f"Giveaway ID: {msg.id} • ChillBot 😎")
     await msg.edit(embed=embed, view=view)
 
     await discord.utils.sleep_until(end_time)
@@ -361,7 +467,7 @@ async def end_giveaway(giveaway_id):
             description=f"**Prize:** {gw['prize']}\n\nNobody entered — no winner this time.",
             color=discord.Color.red()
         )
-        embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
+        embed.set_footer(text=f"Giveaway ID: {giveaway_id} • ChillBot 😎")
         await channel.send(embed=embed)
         return
 
@@ -375,6 +481,7 @@ async def end_giveaway(giveaway_id):
         pick = random.choice(pool)
         chosen.append(pick)
         pool = [uid for uid in pool if uid != pick]
+        record_win(gw["guild_id"], pick)
 
     winners_text = "\n".join(f"<@{uid}>" for uid in chosen)
 
@@ -384,12 +491,13 @@ async def end_giveaway(giveaway_id):
         color=discord.Color.green()
     )
     embed.add_field(name="Hosted by", value=f"<@{gw['host_id']}>", inline=True)
-    embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
+    embed.set_footer(text=f"Giveaway ID: {giveaway_id} • ChillBot 😎")
     await channel.send(embed=embed)
 
 
-@bot.hybrid_command(name="gend", description="End a giveaway early using its message ID")
-async def gend(ctx, message_id: str):
+@bot.hybrid_command(name="end-giveaway", description="End a giveaway early and pick the winner(s) now")
+@app_commands.describe(message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post")
+async def end_giveaway_cmd(ctx, message_id: str):
     if not can_manage_giveaways(ctx.author):
         await ctx.send("You don't have permission to end giveaways.")
         return
@@ -398,15 +506,29 @@ async def gend(ctx, message_id: str):
     except ValueError:
         await ctx.send("That doesn't look like a valid giveaway ID.")
         return
-    if gid not in giveaways or not giveaways[gid]["active"]:
+
+    gw = giveaways.get(gid)
+    if not gw or not gw["active"]:
         await ctx.send("No active giveaway found with that ID.")
         return
+
+    if gw["host_id"] != ctx.author.id and not is_admin_or_owner(ctx.author):
+        allowed = authorized_roles.get(ctx.guild.id, set())
+        user_role_ids = {r.id for r in ctx.author.roles}
+        if not (allowed & user_role_ids):
+            await ctx.send("You can only end giveaways you hosted, unless you're an admin or authorized role.")
+            return
+
     await end_giveaway(gid)
     await ctx.send("Giveaway ended.")
 
 
-@bot.hybrid_command(name="gremove", description="Remove a user from a giveaway")
-async def gremove(ctx, message_id: str, member: discord.Member):
+@bot.hybrid_command(name="remove-participant", description="Remove someone from an active or ended giveaway")
+@app_commands.describe(
+    message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post",
+    member="The person to remove"
+)
+async def remove_participant(ctx, message_id: str, member: discord.Member):
     if not can_manage_giveaways(ctx.author):
         await ctx.send("You don't have permission to manage giveaway entries.")
         return
@@ -424,6 +546,32 @@ async def gremove(ctx, message_id: str, member: discord.Member):
     await ctx.send(f"Removed {member.mention} from that giveaway.")
 
 
+@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")
+async def leaderboard(ctx):
+    guild_wins = win_counts.get(ctx.guild.id, {})
+    if not guild_wins:
+        await ctx.send("No giveaways have been won yet in this server.")
+        return
+
+    sorted_wins = sorted(guild_wins.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, wins) in enumerate(sorted_wins):
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} <@{uid}> — **{wins}** win{'s' if wins != 1 else ''}")
+
+    embed = discord.Embed(
+        title="🏆 Giveaway Leaderboard",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+# ---------- MESSAGE HANDLING ----------
+
 @bot.event
 async def on_message(message):
     try:
@@ -435,6 +583,7 @@ async def on_message(message):
             return
 
         if message.guild:
+            now = time.time()
             for gid, gw in giveaways.items():
                 if not gw["active"]:
                     continue
@@ -447,13 +596,19 @@ async def on_message(message):
                 if message.content.startswith("?"):
                     continue
 
+                key = (gid, message.author.id)
+                last_time = last_message_time.get(key, 0)
+                if now - last_time < MESSAGE_COOLDOWN_SECONDS:
+                    continue
+                last_message_time[key] = now
+
                 mult = get_multiplier(message.guild.id, message.author)
                 for _ in range(mult):
                     gw["entries"].append(message.author.id)
 
         await bot.process_commands(message)
     except Exception as e:
-        print(f"on_message error: {e}")
+        print(f"on_message error: {e}", flush=True)
 
 
 bot.run(os.environ["DISCORD_TOKEN"])
