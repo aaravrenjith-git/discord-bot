@@ -30,7 +30,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 OWNER_ID = 1160627021865549976
 OWNER_NAME = "Aarav"
@@ -206,6 +206,12 @@ def build_giveaway_embed(gw, giveaway_id=None):
     embed.add_field(name=f"{EMOJI['trophy']} Winners", value=str(gw["winners"]), inline=True)
     if gw["required_role_id"]:
         embed.add_field(name="🔑 Required role", value=f"<@&{gw['required_role_id']}>", inline=True)
+    if gw.get("min_messages"):
+        embed.add_field(
+            name="📝 Messages required",
+            value=f"**{gw['min_messages']}** message(s) in the allowed channel(s) to be eligible to win",
+            inline=True
+        )
     blocked_ids = list(blacklisted_roles.get(gw["guild_id"], set()))
     if gw["blacklist_role_id"] and gw["blacklist_role_id"] not in blocked_ids:
         blocked_ids.append(gw["blacklist_role_id"])
@@ -253,6 +259,7 @@ class GiveawayView(discord.ui.View):
             if user.id in gw["joined_users"]:
                 gw["joined_users"].discard(user.id)
                 gw["entries"] = [uid for uid in gw["entries"] if uid != user.id]
+                gw["msg_counts"].pop(user.id, None)
                 await interaction.response.send_message(
                     "You left the giveaway and your entries were removed. 👋 Click again to rejoin — you'll start over with your starting entry.",
                     ephemeral=True
@@ -276,11 +283,13 @@ class GiveawayView(discord.ui.View):
             starting_entries = get_multiplier(interaction.guild.id, user)
             gw["entries"].extend([user.id] * starting_entries)
             entry_word = "entry" if starting_entries == 1 else "entries"
-            await interaction.response.send_message(
+            join_text = (
                 f"✅ You joined and got **{starting_entries}** {entry_word} right away! "
-                "Send messages in the allowed channel(s) to earn more. Click again to leave.",
-                ephemeral=True
+                "Send messages in the allowed channel(s) to earn more. Click again to leave."
             )
+            if gw.get("min_messages"):
+                join_text += f"\n📝 You need to send **{gw['min_messages']}** message(s) in the allowed channel(s) to be eligible to win."
+            await interaction.response.send_message(join_text, ephemeral=True)
         except Exception as e:
             print(f"Join button error: {e}", flush=True)
             if not interaction.response.is_done():
@@ -297,7 +306,12 @@ class GiveawayView(discord.ui.View):
             lines = []
             for uid in gw["joined_users"]:
                 count = gw["entries"].count(uid)
-                lines.append(f"<@{uid}> — **{count}** entr{'y' if count == 1 else 'ies'}")
+                line = f"<@{uid}> — **{count}** entr{'y' if count == 1 else 'ies'}"
+                need = gw.get("min_messages", 0)
+                if need:
+                    sent = gw["msg_counts"].get(uid, 0)
+                    line += f" • {min(sent, need)}/{need} messages {'✅' if sent >= need else '⏳'}"
+                lines.append(line)
 
             text = f"**Participants ({len(gw['joined_users'])}):**\n" + "\n".join(lines)
             if len(text) > 1900:
@@ -355,6 +369,8 @@ async def help_cmd(ctx):
             "**/start-giveaway** — Create a new giveaway with a join button\n"
             "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
             "**/edit-giveaway** — Fix a mistake in a running giveaway\n"
+            "**/reroll** — Pick new winner(s) for a finished giveaway\n"
+            "**/cancel-giveaway** — Cancel a running giveaway without a winner\n"
             "**/remove-participant** — Kick someone out of a giveaway\n"
         ),
         inline=False
@@ -379,6 +395,8 @@ async def help_cmd(ctx):
 # ---------- SETUP COMMAND ----------
 
 @bot.tree.command(name="setup", description="[Admin] Configure giveaway roles, channels, ping role, embed color, and logs")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
 @app_commands.describe(
     action="Which setting do you want to change?",
     role="The role to apply this action to (needed for role-based actions)",
@@ -611,7 +629,8 @@ async def embed_cmd(
     required_role="Only members with this role are allowed to join",
     blacklist_role="Members with this role are blocked from joining (this giveaway only)",
     bypass_role="Members with this role skip the required role and blacklist checks",
-    image_url="A direct image link to display in the giveaway post"
+    image_url="A direct image link to display in the giveaway post",
+    min_messages="Messages people must send to be eligible to win (default: none)"
 )
 async def start_giveaway(
     ctx,
@@ -622,6 +641,7 @@ async def start_giveaway(
     blacklist_role: typing.Optional[discord.Role] = None,
     bypass_role: typing.Optional[discord.Role] = None,
     image_url: typing.Optional[str] = None,
+    min_messages: typing.Optional[int] = 0,
 ):
     if not can_manage_giveaways(ctx.author):
         await ctx.send("You don't have permission to start giveaways.")
@@ -649,6 +669,12 @@ async def start_giveaway(
         await ctx.send("Image URL must be a direct link ending in .png, .jpg, .jpeg, .gif, or .webp.")
         return
 
+    if min_messages is None:
+        min_messages = 0
+    if min_messages < 0 or min_messages > 1000:
+        await ctx.send("The message requirement must be between 0 and 1000.")
+        return
+
     end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
     guild_color = get_guild_color(ctx.guild.id)
 
@@ -662,6 +688,10 @@ async def start_giveaway(
         "blacklist_role_id": blacklist_role.id if blacklist_role else None,
         "bypass_role_id": bypass_role.id if bypass_role else None,
         "image_url": image_url,
+        "min_messages": min_messages,
+        "msg_counts": {},
+        "winner_ids": [],
+        "cancelled": False,
         "end_time": end_time,
         "joined_users": set(),
         "entries": [],
@@ -724,6 +754,44 @@ async def start_giveaway(
         await end_giveaway(msg.id)
 
 
+def eligible_entries(gw, exclude=()):
+    """Entries that can still win: joined, met the message requirement, still in the server, not already a winner."""
+    guild = bot.get_guild(gw["guild_id"])
+    need = gw.get("min_messages", 0)
+    counts = gw.get("msg_counts", {})
+    pool = []
+    for uid in gw["entries"]:
+        if uid in exclude or uid not in gw["joined_users"]:
+            continue
+        if need and counts.get(uid, 0) < need:
+            continue
+        if guild is not None and guild.get_member(uid) is None:
+            continue
+        pool.append(uid)
+    return pool
+
+
+def pick_winners(gw, count, exclude=()):
+    pool = eligible_entries(gw, exclude)
+    chosen = []
+    for _ in range(min(count, len(set(pool)))):
+        pick = random.choice(pool)
+        chosen.append(pick)
+        pool = [uid for uid in pool if uid != pick]
+    return chosen
+
+
+def winners_lines(gw, chosen):
+    lines = []
+    for uid in chosen:
+        n = gw["entries"].count(uid)
+        lines.append(f"{EMOJI['trophy']} <@{uid}> — **{n}** {'entry' if n == 1 else 'entries'}")
+    return "\n".join(lines)
+
+
+USERS_ONLY = discord.AllowedMentions(users=True, roles=False, everyone=False)
+
+
 async def end_giveaway(giveaway_id):
     gw = giveaways.get(giveaway_id)
     if not gw or not gw["active"]:
@@ -737,19 +805,24 @@ async def end_giveaway(giveaway_id):
     if channel is None:
         return
 
-    guild_color = get_guild_color(gw["guild_id"])
+    chosen = pick_winners(gw, gw["winners"])
 
-    if not gw["entries"]:
+    if not chosen:
+        need = gw.get("min_messages", 0)
+        if gw["entries"] and need:
+            reason = f"😢 Nobody sent the required **{need}** message(s) — no winner this time."
+        else:
+            reason = "😢 Nobody entered — no winner this time."
         embed = discord.Embed(
             title=f"{EMOJI['party']} Giveaway Ended",
-            description=f"**Prize:** {gw['prize']}\n\n😢 Nobody entered — no winner this time.",
+            description=f"**Prize:** {gw['prize']}\n\n{reason}",
             color=discord.Color.red()
         )
         embed.set_footer(text=f"Giveaway ID: {giveaway_id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
         await channel.send(embed=embed)
 
         log_embed = discord.Embed(
-            title="🎉 Giveaway Ended (No Entries)",
+            title="🎉 Giveaway Ended (No Winner)",
             description=f"**Prize:** {gw['prize']}",
             color=discord.Color.red()
         )
@@ -757,33 +830,26 @@ async def end_giveaway(giveaway_id):
         await send_log(channel.guild, log_embed)
         return
 
-    pool = list(gw["entries"])
-    chosen = []
-    num_winners = min(gw["winners"], len(set(pool)))
+    gw["winner_ids"] = list(chosen)
+    for uid in chosen:
+        record_win(gw["guild_id"], uid)
 
-    for _ in range(num_winners):
-        if not pool:
-            break
-        pick = random.choice(pool)
-        chosen.append(pick)
-        pool = [uid for uid in pool if uid != pick]
-        record_win(gw["guild_id"], pick)
-
-    winners_text = "\n".join(f"{EMOJI['trophy']} <@{uid}>" for uid in chosen)
+    winners_text = winners_lines(gw, chosen)
+    mentions = " ".join(f"<@{uid}>" for uid in chosen)
 
     embed = discord.Embed(
         title=f"{EMOJI['party']} Giveaway Ended!",
-        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! {EMOJI['party']}",
+        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! {EMOJI['party']}\nBetter luck next time to everyone else! 🍀",
         color=discord.Color.green()
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.add_field(name=f"{EMOJI['host']} Hosted by", value=f"<@{gw['host_id']}>", inline=True)
     embed.set_footer(text=f"Giveaway ID: {giveaway_id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
-    await channel.send(embed=embed)
+    await channel.send(content=f"🎉 Congratulations {mentions}!", embed=embed, allowed_mentions=USERS_ONLY)
 
     log_embed = discord.Embed(
         title="🎉 Giveaway Ended",
-        description=f"**Prize:** {gw['prize']}\n**Winner(s):** {winners_text}",
+        description=f"**Prize:** {gw['prize']}\n**Winner(s):**\n{winners_text}",
         color=discord.Color.green()
     )
     log_embed.add_field(name="Hosted by", value=f"<@{gw['host_id']}>", inline=True)
@@ -827,6 +893,157 @@ async def end_giveaway_cmd(ctx, message_id: str):
     await send_log(ctx.guild, log_embed)
 
 
+@bot.tree.command(name="reroll", description="Pick new winner(s) for a finished giveaway")
+@app_commands.describe(
+    message_id="The giveaway's ID, shown at the bottom of the giveaway post",
+    winners="How many new winners to pick (default: 1)"
+)
+@app_commands.guild_only()
+async def reroll(interaction: discord.Interaction, message_id: str, winners: typing.Optional[int] = 1):
+    if not can_manage_giveaways(interaction.user):
+        await interaction.response.send_message("You don't have permission to reroll giveaways.", ephemeral=True)
+        return
+
+    try:
+        gid = int(message_id.strip())
+    except ValueError:
+        await interaction.response.send_message("That doesn't look like a valid giveaway ID.", ephemeral=True)
+        return
+
+    gw = giveaways.get(gid)
+    if not gw or gw["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("No giveaway found with that ID.", ephemeral=True)
+        return
+    if gw["active"]:
+        await interaction.response.send_message(
+            "That giveaway is still running. Wait for it to finish (or use /end-giveaway) before rerolling.", ephemeral=True
+        )
+        return
+    if gw.get("cancelled"):
+        await interaction.response.send_message("That giveaway was cancelled, so there's nothing to reroll.", ephemeral=True)
+        return
+
+    if winners is None or winners < 1:
+        winners = 1
+    if winners > 20:
+        await interaction.response.send_message("Max 20 winners per reroll.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    chosen = pick_winners(gw, winners, exclude=set(gw.get("winner_ids", [])))
+    if not chosen:
+        await interaction.followup.send(
+            "There's nobody else eligible to win — everyone who qualified has already won.", ephemeral=True
+        )
+        return
+
+    channel = bot.get_channel(gw["channel_id"])
+    if channel is None:
+        await interaction.followup.send("I couldn't find the channel this giveaway was in.", ephemeral=True)
+        return
+
+    winners_text = winners_lines(gw, chosen)
+    mentions = " ".join(f"<@{uid}>" for uid in chosen)
+
+    embed = discord.Embed(
+        title=f"{EMOJI['party']} Giveaway Rerolled!",
+        description=f"**Prize:** {gw['prize']}\n\n**New winner(s):**\n{winners_text}\n\nCongratulations! {EMOJI['party']}\nBetter luck next time to everyone else! 🍀",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name=f"{EMOJI['host']} Hosted by", value=f"<@{gw['host_id']}>", inline=True)
+    embed.set_footer(text=f"Giveaway ID: {gid} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
+
+    try:
+        await channel.send(content=f"🎉 Congratulations {mentions}!", embed=embed, allowed_mentions=USERS_ONLY)
+    except Exception as e:
+        print(f"Reroll announcement failed: {e}", flush=True)
+        await interaction.followup.send(
+            f"I couldn't post in {channel.mention}. Check that I can send messages and embeds there.", ephemeral=True
+        )
+        return
+
+    gw.setdefault("winner_ids", []).extend(chosen)
+    for uid in chosen:
+        record_win(gw["guild_id"], uid)
+
+    await interaction.followup.send(f"✅ Rerolled! New winner(s) announced in {channel.mention}.", ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="🔁 Giveaway Rerolled",
+        description=f"Rerolled by {interaction.user.mention}\n\n**New winner(s):**\n{winners_text}",
+        color=discord.Color.orange()
+    )
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(interaction.guild, log_embed)
+
+
+@bot.tree.command(name="cancel-giveaway", description="Cancel a running giveaway without picking a winner")
+@app_commands.describe(message_id="The giveaway's ID, shown at the bottom of the giveaway post")
+@app_commands.guild_only()
+async def cancel_giveaway(interaction: discord.Interaction, message_id: str):
+    if not can_manage_giveaways(interaction.user):
+        await interaction.response.send_message("You don't have permission to cancel giveaways.", ephemeral=True)
+        return
+
+    try:
+        gid = int(message_id.strip())
+    except ValueError:
+        await interaction.response.send_message("That doesn't look like a valid giveaway ID.", ephemeral=True)
+        return
+
+    gw = giveaways.get(gid)
+    if not gw or not gw["active"] or gw["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("No active giveaway found with that ID.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    gw["active"] = False
+    gw["cancelled"] = True
+    wake = gw.get("wake")
+    if wake:
+        wake.set()
+
+    channel = bot.get_channel(gw["channel_id"])
+
+    # turn the original post into a "cancelled" post and remove its buttons
+    try:
+        post = await channel.fetch_message(gid)
+        cancelled_post = discord.Embed(
+            title="❌ GIVEAWAY CANCELLED",
+            description=f"**Prize -** {gw['prize']}\n\nThis giveaway was cancelled by a host.",
+            color=discord.Color.dark_grey()
+        )
+        cancelled_post.set_footer(text=f"Giveaway ID: {gid} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
+        await post.edit(embed=cancelled_post, view=None)
+    except Exception as e:
+        print(f"Failed to update cancelled giveaway post: {e}", flush=True)
+
+    try:
+        announce = discord.Embed(
+            title="❌ Giveaway Cancelled",
+            description=f"**Prize:** {gw['prize']}\n\nThis giveaway was cancelled — no winner will be picked.",
+            color=discord.Color.red()
+        )
+        announce.add_field(name=f"{EMOJI['host']} Hosted by", value=f"<@{gw['host_id']}>", inline=True)
+        announce.set_footer(text=f"Giveaway ID: {gid} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
+        await channel.send(embed=announce)
+    except Exception as e:
+        print(f"Failed to announce cancellation: {e}", flush=True)
+
+    await interaction.followup.send("✅ Giveaway cancelled.", ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="❌ Giveaway Cancelled",
+        description=f"**Prize:** {gw['prize']}\nCancelled by {interaction.user.mention}",
+        color=discord.Color.orange()
+    )
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(interaction.guild, log_embed)
+
+
 @bot.tree.command(name="edit-giveaway", description="Fix a mistake in a running giveaway")
 @app_commands.describe(
     message_id="The giveaway's ID, shown at the bottom of the giveaway post",
@@ -837,6 +1054,7 @@ async def end_giveaway_cmd(ctx, message_id: str):
     blacklist_role="New blacklisted role for this giveaway",
     bypass_role="New bypass role for this giveaway",
     image_url="New direct image link (.png, .jpg, .jpeg, .gif, .webp)",
+    min_messages="New messages needed to be eligible to win (0 = no requirement)",
     remove="Remove one of the optional extras from this giveaway"
 )
 @app_commands.choices(remove=[
@@ -855,6 +1073,7 @@ async def edit_giveaway(
     blacklist_role: typing.Optional[discord.Role] = None,
     bypass_role: typing.Optional[discord.Role] = None,
     image_url: typing.Optional[str] = None,
+    min_messages: typing.Optional[int] = None,
     remove: typing.Optional[app_commands.Choice[str]] = None,
 ):
     if not interaction.guild:
@@ -878,7 +1097,7 @@ async def edit_giveaway(
         )
         return
 
-    if all(v is None for v in (prize, winners, duration, required_role, blacklist_role, bypass_role, image_url, remove)):
+    if all(v is None for v in (prize, winners, duration, required_role, blacklist_role, bypass_role, image_url, min_messages, remove)):
         await interaction.response.send_message("Pick at least one thing to change.", ephemeral=True)
         return
 
@@ -904,6 +1123,10 @@ async def edit_giveaway(
 
     if image_url is not None and not re.match(r"^https?://\S+\.(png|jpg|jpeg|gif|webp)$", image_url, re.IGNORECASE):
         await interaction.response.send_message("Image URL must be a direct link ending in .png, .jpg, .jpeg, .gif, or .webp.", ephemeral=True)
+        return
+
+    if min_messages is not None and (min_messages < 0 or min_messages > 1000):
+        await interaction.response.send_message("The message requirement must be between 0 and 1000.", ephemeral=True)
         return
 
     # ----- apply -----
@@ -958,6 +1181,10 @@ async def edit_giveaway(
     if image_url is not None:
         gw["image_url"] = image_url
         changes.append("Image updated")
+
+    if min_messages is not None:
+        gw["min_messages"] = min_messages
+        changes.append(f"Messages required → **{min_messages}**" if min_messages else "Removed the message requirement")
 
     if not changes:
         await interaction.response.send_message("Nothing to change — that extra isn't set on this giveaway.", ephemeral=True)
@@ -1014,6 +1241,7 @@ async def remove_participant(ctx, message_id: str, member: discord.Member):
         return
     gw["joined_users"].discard(member.id)
     gw["entries"] = [uid for uid in gw["entries"] if uid != member.id]
+    gw.get("msg_counts", {}).pop(member.id, None)
     await ctx.send(f"Removed {member.mention} from that giveaway.")
 
     log_embed = discord.Embed(
@@ -1117,14 +1345,12 @@ async def on_message(message):
                     continue
                 if not channel_counts(message.guild.id, message.channel.id, gw["channel_id"]):
                     continue
-                if message.content.startswith("?"):
-                    continue
 
+                gw["msg_counts"][message.author.id] = gw["msg_counts"].get(message.author.id, 0) + 1
                 mult = get_multiplier(message.guild.id, message.author)
                 for _ in range(mult):
                     gw["entries"].append(message.author.id)
 
-        await bot.process_commands(message)
     except Exception as e:
         print(f"on_message error: {e}", flush=True)
 
