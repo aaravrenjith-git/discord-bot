@@ -1,4 +1,5 @@
 import os
+import asyncio
 import random
 import discord
 from discord import app_commands
@@ -44,6 +45,22 @@ OWNER_REPLIES = [
     "What can I do for you, master?",
     "Always watching, master. 👀",
 ]
+
+# ---------- EMOJIS ----------
+# Want animated emojis? In Discord, type \:youremoji: and send it. It turns into a code like
+#   <a:party:123456789012345678>     (the "a:" means animated)
+# Paste that code between the quotes below in place of the normal emoji.
+# The emoji must come from a server the bot is in, or be uploaded to your app's Emojis page
+# in the Developer Portal. Leave a line as-is to keep the normal emoji.
+# (Emojis show up in titles, descriptions, field text and buttons, but not in embed footers.)
+EMOJI = {
+    "party": "🎉",     # giveaway titles + Join button
+    "sparkle": "✨",   # around the prize
+    "host": "🎤",      # "Hosted by"
+    "clock": "⏰",     # "Ends"
+    "trophy": "🏆",    # winners
+    "people": "👥",    # Participants button
+}
 
 # ---------- DATA STORES (in memory) ----------
 
@@ -152,12 +169,46 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             print(f"Failed to send log: {e}", flush=True)
 
 
+def build_giveaway_embed(gw, giveaway_id=None):
+    """Builds the giveaway post from the stored giveaway data (used when starting AND editing)."""
+    embed = discord.Embed(
+        title=f"{EMOJI['party']}  G I V E A W A Y  {EMOJI['party']}",
+        description=f"{EMOJI['sparkle']} **{gw['prize']}** {EMOJI['sparkle']}\n\nClick **Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n*Click Join again anytime to leave.*",
+        color=get_guild_color(gw["guild_id"])
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name=f"{EMOJI['host']} Hosted by", value=f"<@{gw['host_id']}>", inline=True)
+    embed.add_field(name=f"{EMOJI['clock']} Ends", value=discord.utils.format_dt(gw["end_time"], style="R"), inline=True)
+    embed.add_field(name=f"{EMOJI['trophy']} Winners", value=str(gw["winners"]), inline=True)
+    if gw["required_role_id"]:
+        embed.add_field(name="🔑 Required role", value=f"<@&{gw['required_role_id']}>", inline=True)
+    if gw["blacklist_role_id"]:
+        embed.add_field(name="🚫 Blacklisted role", value=f"<@&{gw['blacklist_role_id']}>", inline=True)
+    if gw["bypass_role_id"]:
+        embed.add_field(name="⚡ Bypass role", value=f"<@&{gw['bypass_role_id']}>", inline=True)
+
+    guild_mults = multiplier_roles.get(gw["guild_id"], {})
+    if guild_mults:
+        mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
+        embed.add_field(name="⭐ Bonus entry roles", value=mults_text, inline=False)
+
+    if gw.get("image_url"):
+        embed.set_image(url=gw["image_url"])
+
+    if giveaway_id:
+        footer = f"Giveaway ID: {giveaway_id} • ChillBot 😎"
+    else:
+        footer = "Starting... • ChillBot 😎"
+    embed.set_footer(text=footer, icon_url=bot.user.display_avatar.url)
+    return embed
+
+
 class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id):
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
 
-    @discord.ui.button(label="🎉 Join Giveaway", style=discord.ButtonStyle.green, custom_id="join_btn")
+    @discord.ui.button(label="Join Giveaway", emoji=EMOJI["party"], style=discord.ButtonStyle.green, custom_id="join_btn")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             gw = giveaways.get(self.giveaway_id)
@@ -196,7 +247,7 @@ class GiveawayView(discord.ui.View):
             if not interaction.response.is_done():
                 await interaction.response.send_message("Something went wrong, try again.", ephemeral=True)
 
-    @discord.ui.button(label="👥 Participants", style=discord.ButtonStyle.blurple, custom_id="participants_btn")
+    @discord.ui.button(label="Participants", emoji=EMOJI["people"], style=discord.ButtonStyle.blurple, custom_id="participants_btn")
     async def participants_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             gw = giveaways.get(self.giveaway_id)
@@ -264,6 +315,7 @@ async def help_cmd(ctx):
         value=(
             "**/start-giveaway** — Create a new giveaway with a join button\n"
             "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
+            "**/edit-giveaway** — Fix a mistake in a running giveaway\n"
             "**/remove-participant** — Kick someone out of a giveaway\n"
         ),
         inline=False
@@ -275,7 +327,10 @@ async def help_cmd(ctx):
     )
     embed.add_field(
         name="⚙️ Admin Only",
-        value="**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel",
+        value=(
+            "**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel\n"
+            "**/embed** — Send a custom embed with your own title and text"
+        ),
         inline=False
     )
     embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
@@ -376,7 +431,14 @@ async def setup_cmd(
 
     elif act == "set_ping_role":
         default_ping_roles[guild_id] = role.id
-        await interaction.response.send_message(f"✅ {role.mention} will now be pinged automatically on new giveaways.", ephemeral=True)
+        reply = f"✅ {role.mention} will now be pinged automatically on new giveaways."
+        if not role.mentionable and not interaction.guild.me.guild_permissions.mention_everyone:
+            reply += (
+                "\n⚠️ Heads up: this role isn't mentionable and I don't have the "
+                "**Mention @everyone, @here, and All Roles** permission, so the ping won't actually notify anyone. "
+                "Either turn on *Allow anyone to @mention this role* in the role's settings, or give me that permission."
+            )
+        await interaction.response.send_message(reply, ephemeral=True)
 
     elif act == "remove_ping_role":
         default_ping_roles.pop(guild_id, None)
@@ -426,6 +488,75 @@ async def setup_cmd(
         embed.add_field(name="Embed color", value=color_hex, inline=True)
         embed.add_field(name="Log channel", value=log_txt, inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------- CUSTOM EMBED COMMAND ----------
+
+@bot.hybrid_command(name="embed", description="Send a custom embed message (Admins only)")
+@app_commands.describe(
+    title="The embed's title",
+    content="The embed's text. Use \\n for a new line. Paste <a:name:id> for animated emojis",
+    color="Optional hex color, e.g. #FF5733 (defaults to the server's embed color)",
+    image_url="Optional direct image link (.png, .jpg, .gif, .webp)",
+    channel="Optional channel to send it in (defaults to this channel)"
+)
+async def embed_cmd(
+    ctx,
+    title: str,
+    content: str,
+    color: typing.Optional[str] = None,
+    image_url: typing.Optional[str] = None,
+    channel: typing.Optional[discord.TextChannel] = None,
+):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.", ephemeral=True)
+        return
+
+    if len(title) > 256:
+        await ctx.send("Title is too long (max 256 characters).", ephemeral=True)
+        return
+
+    text = content.replace("\\n", "\n")
+    if len(text) > 4096:
+        await ctx.send("Content is too long (max 4096 characters).", ephemeral=True)
+        return
+
+    if color:
+        if not re.match(r"^#?[0-9A-Fa-f]{6}$", color):
+            await ctx.send("Please provide a valid hex color, e.g. #FF5733.", ephemeral=True)
+            return
+        embed_color = discord.Color.from_str(color if color.startswith("#") else f"#{color}")
+    else:
+        embed_color = get_guild_color(ctx.guild.id)
+
+    if image_url and not re.match(r"^https?://\S+\.(png|jpg|jpeg|gif|webp)$", image_url, re.IGNORECASE):
+        await ctx.send("Image URL must be a direct link ending in .png, .jpg, .jpeg, .gif, or .webp.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title=title, description=text, color=embed_color)
+    if image_url:
+        embed.set_image(url=image_url)
+
+    target = channel or ctx.channel
+    perms = target.permissions_for(ctx.guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        await ctx.send(
+            f"I need **View Channel**, **Send Messages** and **Embed Links** in {target.mention} to post there.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await target.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.send(f"I don't have permission to send messages in {target.mention}.", ephemeral=True)
+        return
+
+    await ctx.send(f"✅ Embed sent in {target.mention}.", ephemeral=True)
 
 
 # ---------- GIVEAWAY COMMANDS ----------
@@ -479,42 +610,9 @@ async def start_giveaway(
         return
 
     end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
-    timestamp = discord.utils.format_dt(end_time, style="R")
     guild_color = get_guild_color(ctx.guild.id)
 
-    embed = discord.Embed(
-        title="🎉  G I V E A W A Y  🎉",
-        description=f"✨ **{prize}** ✨\n\nClick **🎉 Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n*Click Join again anytime to leave.*",
-        color=guild_color
-    )
-    embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(name="🎤 Hosted by", value=ctx.author.mention, inline=True)
-    embed.add_field(name="⏰ Ends", value=timestamp, inline=True)
-    embed.add_field(name="🏆 Winners", value=str(winners), inline=True)
-    if required_role:
-        embed.add_field(name="🔑 Required role", value=required_role.mention, inline=True)
-    if blacklist_role:
-        embed.add_field(name="🚫 Blacklisted role", value=blacklist_role.mention, inline=True)
-    if bypass_role:
-        embed.add_field(name="⚡ Bypass role", value=bypass_role.mention, inline=True)
-
-    guild_mults = multiplier_roles.get(ctx.guild.id, {})
-    if guild_mults:
-        mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
-        embed.add_field(name="⭐ Bonus entry roles", value=mults_text, inline=False)
-
-    if image_url:
-        embed.set_image(url=image_url)
-
-    embed.set_footer(text="Starting... • ChillBot 😎", icon_url=bot.user.display_avatar.url)
-
-    final_ping_role = ping_role or (ctx.guild.get_role(default_ping_roles[ctx.guild.id]) if ctx.guild.id in default_ping_roles else None)
-    content = final_ping_role.mention if final_ping_role else None
-
-    msg = await ctx.send(content=content, embed=embed)
-    view = GiveawayView(msg.id)
-
-    giveaways[msg.id] = {
+    gw = {
         "channel_id": ctx.channel.id,
         "guild_id": ctx.guild.id,
         "host_id": ctx.author.id,
@@ -523,13 +621,42 @@ async def start_giveaway(
         "required_role_id": required_role.id if required_role else None,
         "blacklist_role_id": blacklist_role.id if blacklist_role else None,
         "bypass_role_id": bypass_role.id if bypass_role else None,
+        "image_url": image_url,
+        "end_time": end_time,
         "joined_users": set(),
         "entries": [],
         "active": True,
+        "wake": asyncio.Event(),
     }
 
-    embed.set_footer(text=f"Giveaway ID: {msg.id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
-    await msg.edit(embed=embed, view=view)
+    final_ping_role = ping_role or (ctx.guild.get_role(default_ping_roles[ctx.guild.id]) if ctx.guild.id in default_ping_roles else None)
+    content = final_ping_role.mention if final_ping_role else None
+
+    msg = await ctx.send(content=content, embed=build_giveaway_embed(gw))
+    giveaways[msg.id] = gw
+    view = GiveawayView(msg.id)
+    await msg.edit(embed=build_giveaway_embed(gw, msg.id), view=view)
+
+    # Private confirmation for the host (slash commands only)
+    if ctx.interaction:
+        try:
+            jump_url = f"https://discord.com/channels/{ctx.guild.id}/{ctx.channel.id}/{msg.id}"
+            confirm = discord.Embed(
+                title="✅ Your giveaway is live!",
+                description=(
+                    f"**Prize:** {prize}\n"
+                    f"**Winners:** {winners}\n"
+                    f"**Ends:** {discord.utils.format_dt(end_time, style='R')}\n"
+                    f"**Giveaway ID:** `{msg.id}`\n\n"
+                    f"[Jump to the giveaway]({jump_url})\n\n"
+                    f"Made a mistake? Use **/edit-giveaway** with that ID to fix it, "
+                    f"or **/end-giveaway** to end it early."
+                ),
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=confirm, ephemeral=True)
+        except Exception as e:
+            print(f"Confirmation message failed: {e}", flush=True)
 
     log_embed = discord.Embed(
         title="🎉 Giveaway Started",
@@ -541,8 +668,18 @@ async def start_giveaway(
     log_embed.set_footer(text=f"Giveaway ID: {msg.id}")
     await send_log(ctx.guild, log_embed)
 
-    await discord.utils.sleep_until(end_time)
-    if giveaways.get(msg.id, {}).get("active"):
+    # Wait until the (possibly edited) end time, or until the giveaway is ended early
+    while gw["active"]:
+        remaining = (gw["end_time"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait_for(gw["wake"].wait(), timeout=remaining)
+            gw["wake"].clear()
+        except asyncio.TimeoutError:
+            break
+
+    if gw["active"]:
         await end_giveaway(msg.id)
 
 
@@ -552,6 +689,9 @@ async def end_giveaway(giveaway_id):
         return
 
     gw["active"] = False
+    wake = gw.get("wake")
+    if wake:
+        wake.set()
     channel = bot.get_channel(gw["channel_id"])
     if channel is None:
         return
@@ -560,7 +700,7 @@ async def end_giveaway(giveaway_id):
 
     if not gw["entries"]:
         embed = discord.Embed(
-            title="🎉 Giveaway Ended",
+            title=f"{EMOJI['party']} Giveaway Ended",
             description=f"**Prize:** {gw['prize']}\n\n😢 Nobody entered — no winner this time.",
             color=discord.Color.red()
         )
@@ -588,15 +728,15 @@ async def end_giveaway(giveaway_id):
         pool = [uid for uid in pool if uid != pick]
         record_win(gw["guild_id"], pick)
 
-    winners_text = "\n".join(f"🏆 <@{uid}>" for uid in chosen)
+    winners_text = "\n".join(f"{EMOJI['trophy']} <@{uid}>" for uid in chosen)
 
     embed = discord.Embed(
-        title="🎉 Giveaway Ended!",
-        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! 🎊",
+        title=f"{EMOJI['party']} Giveaway Ended!",
+        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! {EMOJI['party']}",
         color=discord.Color.green()
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(name="🎤 Hosted by", value=f"<@{gw['host_id']}>", inline=True)
+    embed.add_field(name=f"{EMOJI['host']} Hosted by", value=f"<@{gw['host_id']}>", inline=True)
     embed.set_footer(text=f"Giveaway ID: {giveaway_id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
     await channel.send(embed=embed)
 
@@ -644,6 +784,173 @@ async def end_giveaway_cmd(ctx, message_id: str):
     )
     log_embed.set_footer(text=f"Giveaway ID: {gid}")
     await send_log(ctx.guild, log_embed)
+
+
+@bot.tree.command(name="edit-giveaway", description="Fix a mistake in a running giveaway")
+@app_commands.describe(
+    message_id="The giveaway's ID, shown at the bottom of the giveaway post",
+    prize="New prize text",
+    winners="New number of winners (1-20)",
+    duration="New time left from now, e.g. 30m, 2h, 1d (replaces the current end time)",
+    required_role="New role required to join",
+    blacklist_role="New blacklisted role for this giveaway",
+    bypass_role="New bypass role for this giveaway",
+    image_url="New direct image link (.png, .jpg, .jpeg, .gif, .webp)",
+    remove="Remove one of the optional extras from this giveaway"
+)
+@app_commands.choices(remove=[
+    app_commands.Choice(name="Remove the required role", value="required_role"),
+    app_commands.Choice(name="Remove the blacklisted role", value="blacklist_role"),
+    app_commands.Choice(name="Remove the bypass role", value="bypass_role"),
+    app_commands.Choice(name="Remove the image", value="image"),
+])
+async def edit_giveaway(
+    interaction: discord.Interaction,
+    message_id: str,
+    prize: typing.Optional[str] = None,
+    winners: typing.Optional[int] = None,
+    duration: typing.Optional[str] = None,
+    required_role: typing.Optional[discord.Role] = None,
+    blacklist_role: typing.Optional[discord.Role] = None,
+    bypass_role: typing.Optional[discord.Role] = None,
+    image_url: typing.Optional[str] = None,
+    remove: typing.Optional[app_commands.Choice[str]] = None,
+):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in servers.", ephemeral=True)
+        return
+
+    if not can_manage_giveaways(interaction.user):
+        await interaction.response.send_message("You don't have permission to edit giveaways.", ephemeral=True)
+        return
+
+    try:
+        gid = int(message_id.strip())
+    except ValueError:
+        await interaction.response.send_message("That doesn't look like a valid giveaway ID.", ephemeral=True)
+        return
+
+    gw = giveaways.get(gid)
+    if not gw or not gw["active"] or gw["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message(
+            "No active giveaway found with that ID. Ended giveaways can't be edited.", ephemeral=True
+        )
+        return
+
+    if all(v is None for v in (prize, winners, duration, required_role, blacklist_role, bypass_role, image_url, remove)):
+        await interaction.response.send_message("Pick at least one thing to change.", ephemeral=True)
+        return
+
+    # ----- validate everything before changing anything -----
+    if prize is not None and (not prize.strip() or len(prize) > 200):
+        await interaction.response.send_message("Prize must be 1-200 characters.", ephemeral=True)
+        return
+
+    if winners is not None and (winners < 1 or winners > 20):
+        await interaction.response.send_message("Winners must be between 1 and 20.", ephemeral=True)
+        return
+
+    new_end = None
+    if duration is not None:
+        seconds = parse_duration(duration)
+        if seconds is None:
+            await interaction.response.send_message("Invalid duration. Use formats like `30m`, `1h`, `2d`, or `1h30m`.", ephemeral=True)
+            return
+        if seconds > 30 * 86400:
+            await interaction.response.send_message("Duration can't be longer than 30 days.", ephemeral=True)
+            return
+        new_end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+
+    if image_url is not None and not re.match(r"^https?://\S+\.(png|jpg|jpeg|gif|webp)$", image_url, re.IGNORECASE):
+        await interaction.response.send_message("Image URL must be a direct link ending in .png, .jpg, .jpeg, .gif, or .webp.", ephemeral=True)
+        return
+
+    # ----- apply -----
+    changes = []
+    role_changed = False
+
+    if remove:
+        if remove.value == "required_role" and gw["required_role_id"]:
+            gw["required_role_id"] = None
+            changes.append("Removed the required role")
+            role_changed = True
+        elif remove.value == "blacklist_role" and gw["blacklist_role_id"]:
+            gw["blacklist_role_id"] = None
+            changes.append("Removed the blacklisted role")
+            role_changed = True
+        elif remove.value == "bypass_role" and gw["bypass_role_id"]:
+            gw["bypass_role_id"] = None
+            changes.append("Removed the bypass role")
+            role_changed = True
+        elif remove.value == "image" and gw.get("image_url"):
+            gw["image_url"] = None
+            changes.append("Removed the image")
+
+    if prize is not None:
+        gw["prize"] = prize
+        changes.append(f"Prize → **{prize}**")
+
+    if winners is not None:
+        gw["winners"] = winners
+        changes.append(f"Winners → **{winners}**")
+
+    if new_end is not None:
+        gw["end_time"] = new_end
+        gw["wake"].set()
+        changes.append(f"Ends → {discord.utils.format_dt(new_end, style='R')}")
+
+    if required_role:
+        gw["required_role_id"] = required_role.id
+        changes.append(f"Required role → {required_role.mention}")
+        role_changed = True
+
+    if blacklist_role:
+        gw["blacklist_role_id"] = blacklist_role.id
+        changes.append(f"Blacklisted role → {blacklist_role.mention}")
+        role_changed = True
+
+    if bypass_role:
+        gw["bypass_role_id"] = bypass_role.id
+        changes.append(f"Bypass role → {bypass_role.mention}")
+        role_changed = True
+
+    if image_url is not None:
+        gw["image_url"] = image_url
+        changes.append("Image updated")
+
+    if not changes:
+        await interaction.response.send_message("Nothing to change — that extra isn't set on this giveaway.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # ----- refresh the giveaway post -----
+    post_updated = True
+    try:
+        channel = bot.get_channel(gw["channel_id"])
+        giveaway_msg = await channel.fetch_message(gid)
+        await giveaway_msg.edit(embed=build_giveaway_embed(gw, gid))
+    except Exception as e:
+        print(f"Failed to update giveaway post: {e}", flush=True)
+        post_updated = False
+
+    description = "\n".join(f"• {c}" for c in changes)
+    if role_changed:
+        description += "\n\n*Role changes only affect people who join from now on.*"
+    if not post_updated:
+        description += "\n\n⚠️ I saved the changes, but couldn't update the giveaway post (was it deleted?)."
+
+    result = discord.Embed(title="✏️ Giveaway updated", description=description, color=discord.Color.green())
+    result.set_footer(text=f"Giveaway ID: {gid}")
+    await interaction.followup.send(embed=result, ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="✏️ Giveaway Edited",
+        description=f"Edited by {interaction.user.mention}\n\n" + "\n".join(f"• {c}" for c in changes),
+        color=discord.Color.orange()
+    )
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(interaction.guild, log_embed)
 
 
 @bot.hybrid_command(name="remove-participant", description="Remove someone from an active or ended giveaway")
