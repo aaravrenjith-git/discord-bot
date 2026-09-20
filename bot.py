@@ -6,6 +6,7 @@ from discord.ext import commands
 import typing
 import re
 import datetime
+import aiohttp
 from flask import Flask
 from threading import Thread
 from pymongo import MongoClient
@@ -271,6 +272,69 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             print(f"Failed to send log: {e}", flush=True)
 
 
+class ParticipantsView(discord.ui.View):
+    def __init__(self, giveaway_id, page=1):
+        super().__init__(timeout=180)
+        self.giveaway_id = giveaway_id
+        self.page = page
+        self.per_page = 10
+
+    def build_embed(self, viewer_id, guild_color):
+        gw = giveaways.get(self.giveaway_id)
+        if not gw:
+            return discord.Embed(description="This giveaway no longer exists.", color=guild_color), 1
+
+        sorted_users = sorted(
+            gw["joined_users"],
+            key=lambda uid: (-gw["entries"].count(uid), uid)
+        )
+
+        total_participants = len(sorted_users)
+        total_entries = len(gw["entries"])
+        total_pages = max(1, (total_participants + self.per_page - 1) // self.per_page)
+        self.page = max(1, min(self.page, total_pages))
+
+        start = (self.page - 1) * self.per_page
+        end = start + self.per_page
+        page_users = sorted_users[start:end]
+
+        lines = []
+        for i, uid in enumerate(page_users, start=start + 1):
+            count = gw["entries"].count(uid)
+            lines.append(f"{i}. <@{uid}> ({count} entr{'y' if count == 1 else 'ies'})")
+
+        your_entries = gw["entries"].count(viewer_id)
+        chance = round((your_entries / total_entries) * 100, 1) if total_entries else 0
+
+        embed = discord.Embed(
+            title=f"🎉 Giveaway Participants (Page {self.page}/{total_pages})",
+            description=(
+                f"These are the members that have participated in the giveaway of **{gw['prize']}**:\n\n"
+                + ("\n".join(lines) if lines else "No participants on this page.")
+                + f"\n\n**Total Participants:** {total_participants}\n**Total Entries:** {total_entries}\n\n"
+                + f"**Your Entries:** {your_entries}\n**Your Chance of Winning:** {chance}%"
+            ),
+            color=guild_color
+        )
+
+        self.prev_button.disabled = self.page <= 1
+        self.next_button.disabled = self.page >= total_pages
+
+        return embed, total_pages
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.grey)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        embed, _ = self.build_embed(interaction.user.id, get_guild_color(interaction.guild.id))
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.grey)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        embed, _ = self.build_embed(interaction.user.id, get_guild_color(interaction.guild.id))
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
 class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id):
         super().__init__(timeout=None)
@@ -325,15 +389,9 @@ class GiveawayView(discord.ui.View):
                 await interaction.response.send_message("No one has joined yet.", ephemeral=True)
                 return
 
-            lines = []
-            for uid in gw["joined_users"]:
-                count = gw["entries"].count(uid)
-                lines.append(f"<@{uid}> — **{count}** entr{'y' if count == 1 else 'ies'}")
-
-            text = f"**Participants ({len(gw['joined_users'])}):**\n" + "\n".join(lines)
-            if len(text) > 1900:
-                text = text[:1900] + "\n...(list truncated)"
-            await interaction.response.send_message(text, ephemeral=True)
+            view = ParticipantsView(self.giveaway_id, page=1)
+            embed, _ = view.build_embed(interaction.user.id, get_guild_color(interaction.guild.id))
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         except Exception as e:
             print(f"Participants button error: {e}", flush=True)
             if not interaction.response.is_done():
@@ -400,6 +458,29 @@ async def help_cmd(ctx):
         value="**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel",
         inline=False
     )
+    embed.add_field(
+        name="🎮 Fun",
+        value=(
+            "**/8ball** — Ask the magic 8-ball a question\n"
+            "**/roll** — Roll dice, e.g. 2d20\n"
+            "**/meme** — Get a random meme\n"
+            "**/coinflip** — Flip a coin\n"
+            "**/game** — Play rock-paper-scissors vs ChillBot or a friend\n"
+            "**/ping** — Check ChillBot's latency"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🌍 Anywhere (DMs, group chats, or servers)",
+        value=(
+            "**/translate** — Translate text into another language\n"
+            "**/wordle** — Guess the 5-letter word in 6 tries\n"
+            "**/minesweeper** — Generate a spoiler-tag minesweeper grid\n"
+            "**/higher-lower** — Guess if the next card is higher or lower\n"
+            "**/connect4** — Challenge a friend to Connect 4"
+        ),
+        inline=False
+    )
     embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
     await ctx.send(embed=embed)
 
@@ -407,6 +488,8 @@ async def help_cmd(ctx):
 # ---------- SETUP COMMAND ----------
 
 @bot.tree.command(name="setup", description="[Admin] Configure giveaway roles, channels, ping role, embed color, and logs")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
     action="Which setting do you want to change?",
     role="The role to apply this action to (needed for role-based actions)",
@@ -439,12 +522,14 @@ async def setup_cmd(
     multiplier: typing.Optional[int] = None,
     color: typing.Optional[str] = None,
 ):
-    if not is_admin_or_owner(interaction.user):
-        await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
-        return
-
     guild_id = interaction.guild.id
     act = action.value
+
+    is_owner_color_override = (interaction.user.id == OWNER_ID and act in ("set_embed_color", "reset_embed_color"))
+
+    if not is_admin_or_owner(interaction.user) and not is_owner_color_override:
+        await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
+        return
 
     if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role") and not role:
         await interaction.response.send_message("Please pick a role for this action.", ephemeral=True)
@@ -567,6 +652,9 @@ async def setup_cmd(
 # ---------- GIVEAWAY COMMANDS ----------
 
 @bot.hybrid_command(name="start-giveaway", description="Create a new giveaway with a join button")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
     duration="How long the giveaway runs, e.g. 30m, 1h, 2d, 1h30m",
     prize="What you're giving away",
@@ -753,6 +841,9 @@ async def end_giveaway(giveaway_id):
 
 
 @bot.hybrid_command(name="end-giveaway", description="End a giveaway early and pick the winner(s) now")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post")
 async def end_giveaway_cmd(ctx, message_id: str):
     if not can_manage_giveaways(ctx.author):
@@ -789,6 +880,9 @@ async def end_giveaway_cmd(ctx, message_id: str):
 
 
 @bot.hybrid_command(name="remove-participant", description="Remove someone from an active or ended giveaway")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
     message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post",
     member="The person to remove"
@@ -843,6 +937,592 @@ async def leaderboard(ctx):
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.set_footer(text="ChillBot 😎")
     await ctx.send(embed=embed)
+
+
+# ---------- FUN COMMANDS ----------
+
+EIGHT_BALL_ANSWERS = [
+    "It is certain. 🔮",
+    "Without a doubt. ✨",
+    "Yes, definitely. ✅",
+    "You may rely on it. 🌟",
+    "Most likely. 👍",
+    "Outlook good. 🌤️",
+    "Signs point to yes. ➡️",
+    "Reply hazy, try again. 🌫️",
+    "Ask again later. ⏳",
+    "Better not tell you now. 🤐",
+    "Cannot predict now. 🔮",
+    "Concentrate and ask again. 🧘",
+    "Don't count on it. ❌",
+    "My reply is no. 🚫",
+    "My sources say no. 📉",
+    "Outlook not so good. ☁️",
+    "Very doubtful. 🤨",
+]
+
+
+@bot.hybrid_command(name="8ball", description="Ask the magic 8-ball a question")
+@app_commands.describe(question="What do you want to ask?")
+async def eight_ball(ctx, *, question: str):
+    embed = discord.Embed(
+        title="🎱 Magic 8-Ball",
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+    )
+    embed.add_field(name="Question", value=question, inline=False)
+    embed.add_field(name="Answer", value=random.choice(EIGHT_BALL_ANSWERS), inline=False)
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="roll", description="Roll dice, e.g. 2d20")
+@app_commands.describe(dice="Format: [count]d[sides], e.g. 2d20 or 1d6")
+async def roll(ctx, dice: str = "1d6"):
+    match = re.match(r"^(\d+)d(\d+)$", dice.strip().lower())
+    if not match:
+        await ctx.send("Invalid format. Use something like `2d20` (2 dice, 20 sides each).")
+        return
+
+    count, sides = int(match.group(1)), int(match.group(2))
+    if count < 1 or count > 100:
+        await ctx.send("Dice count must be between 1 and 100.")
+        return
+    if sides < 2 or sides > 1000:
+        await ctx.send("Sides must be between 2 and 1000.")
+        return
+
+    rolls = [random.randint(1, sides) for _ in range(count)]
+    total = sum(rolls)
+
+    embed = discord.Embed(
+        title="🎲 Dice Roll",
+        description=f"Rolling **{dice}**...",
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+    )
+    rolls_text = ", ".join(str(r) for r in rolls)
+    if len(rolls_text) > 1000:
+        rolls_text = rolls_text[:1000] + "..."
+    embed.add_field(name="Results", value=rolls_text, inline=False)
+    embed.add_field(name="Total", value=str(total), inline=False)
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="meme", description="Get a random meme")
+async def meme(ctx):
+    await ctx.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            for _ in range(3):
+                async with session.get("https://meme-api.com/gimme") as resp:
+                    if resp.status != 200:
+                        await ctx.send("Couldn't fetch a meme right now, try again in a bit.")
+                        return
+                    data = await resp.json()
+                    if not data.get("nsfw"):
+                        break
+            else:
+                await ctx.send("Couldn't find a clean meme right now, try again.")
+                return
+
+        embed = discord.Embed(
+            title=data.get("title", "Random Meme"),
+            color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+        )
+        embed.set_image(url=data["url"])
+        embed.set_footer(text=f"r/{data.get('subreddit', 'memes')} • ChillBot 😎")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        print(f"Meme command error: {e}", flush=True)
+        await ctx.send("Something went wrong fetching a meme, try again.")
+
+
+@bot.hybrid_command(name="coinflip", description="Flip a coin")
+async def coinflip(ctx):
+    result = random.choice(["Heads", "Tails"])
+    emoji = "🪙"
+    embed = discord.Embed(
+        title=f"{emoji} Coin Flip",
+        description=f"The coin landed on **{result}**!",
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+    )
+    await ctx.send(embed=embed)
+
+
+RPS_EMOJIS = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
+RPS_BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+
+
+def rps_winner(choice1, choice2):
+    if choice1 == choice2:
+        return 0
+    if RPS_BEATS[choice1] == choice2:
+        return 1
+    return 2
+
+
+class RPSView(discord.ui.View):
+    def __init__(self, player1_id, player2_id=None):
+        super().__init__(timeout=60)
+        self.player1_id = player1_id
+        self.player2_id = player2_id
+        self.choices = {}
+
+    async def handle_choice(self, interaction: discord.Interaction, choice: str):
+        user_id = interaction.user.id
+
+        if user_id != self.player1_id and user_id != self.player2_id:
+            if self.player2_id is not None:
+                await interaction.response.send_message("This isn't your game!", ephemeral=True)
+                return
+
+        if self.player2_id is None and user_id != self.player1_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+
+        self.choices[user_id] = choice
+        await interaction.response.send_message(f"You picked **{choice}** {RPS_EMOJIS[choice]}", ephemeral=True)
+
+        opponent_id = self.player2_id if self.player2_id else "BOT"
+
+        if self.player2_id is None:
+            bot_choice = random.choice(list(RPS_EMOJIS.keys()))
+            await self.reveal(interaction, self.choices[user_id], bot_choice, interaction.user.mention, "ChillBot 🤖")
+        elif self.player1_id in self.choices and self.player2_id in self.choices:
+            p1_choice = self.choices[self.player1_id]
+            p2_choice = self.choices[self.player2_id]
+            p1_mention = f"<@{self.player1_id}>"
+            p2_mention = f"<@{self.player2_id}>"
+            await self.reveal(interaction, p1_choice, p2_choice, p1_mention, p2_mention)
+
+    async def reveal(self, interaction, choice1, choice2, name1, name2):
+        result = rps_winner(choice1, choice2)
+        if result == 0:
+            outcome = "🤝 It's a tie!"
+        elif result == 1:
+            outcome = f"🎉 {name1} wins!"
+        else:
+            outcome = f"🎉 {name2} wins!"
+
+        embed = discord.Embed(
+            title="✊ 📄 ✂️ Rock Paper Scissors",
+            description=(
+                f"{name1} picked {RPS_EMOJIS[choice1]}\n"
+                f"{name2} picked {RPS_EMOJIS[choice2]}\n\n"
+                f"**{outcome}**"
+            ),
+            color=get_guild_color(interaction.guild.id) if interaction.guild else DEFAULT_COLOR
+        )
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Rock 🪨", style=discord.ButtonStyle.grey)
+    async def rock_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_choice(interaction, "rock")
+
+    @discord.ui.button(label="Paper 📄", style=discord.ButtonStyle.grey)
+    async def paper_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_choice(interaction, "paper")
+
+    @discord.ui.button(label="Scissors ✂️", style=discord.ButtonStyle.grey)
+    async def scissors_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_choice(interaction, "scissors")
+
+
+@bot.hybrid_command(name="game", description="Play rock-paper-scissors against ChillBot or challenge a friend")
+@app_commands.describe(opponent="Optional: challenge this member instead of playing against ChillBot")
+async def game(ctx, opponent: typing.Optional[discord.Member] = None):
+    if opponent and opponent.bot:
+        await ctx.send("You can't challenge a bot to this game.")
+        return
+    if opponent and opponent.id == ctx.author.id:
+        await ctx.send("You can't challenge yourself!")
+        return
+
+    if opponent:
+        description = f"{ctx.author.mention} has challenged {opponent.mention} to Rock, Paper, Scissors!\nBoth players, pick your move below (your pick stays hidden until both choose)."
+        view = RPSView(ctx.author.id, opponent.id)
+    else:
+        description = f"{ctx.author.mention} is playing against ChillBot! Pick your move:"
+        view = RPSView(ctx.author.id, None)
+
+    embed = discord.Embed(
+        title="✊ 📄 ✂️ Rock Paper Scissors",
+        description=description,
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+    )
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.hybrid_command(name="ping", description="Check ChillBot's latency")
+async def ping(ctx):
+    latency = round(bot.latency * 1000)
+    embed = discord.Embed(
+        description=f"🏓 Pong! **{latency}ms**",
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
+    )
+    await ctx.send(embed=embed)
+
+
+# ---------- ANYWHERE COMMANDS (work in DMs, group DMs, and servers) ----------
+
+LANGUAGE_CODES = {
+    "english": "en", "spanish": "es", "french": "fr", "german": "de",
+    "italian": "it", "portuguese": "pt", "dutch": "nl", "russian": "ru",
+    "japanese": "ja", "korean": "ko", "chinese": "zh", "arabic": "ar",
+    "hindi": "hi", "turkish": "tr", "polish": "pl", "swedish": "sv",
+    "greek": "el", "hebrew": "he", "vietnamese": "vi", "thai": "th",
+    "indonesian": "id", "tamil": "ta", "malayalam": "ml", "bengali": "bn",
+    "urdu": "ur",
+}
+
+
+@bot.hybrid_command(name="translate", description="Translate text into another language")
+@app_commands.describe(text="The text to translate", language="Target language, e.g. Spanish or es")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def translate(ctx, language: str, *, text: str):
+    if len(text) > 500:
+        await ctx.send("Text is too long (max 500 characters).")
+        return
+
+    target = LANGUAGE_CODES.get(language.strip().lower(), language.strip().lower())
+
+    await ctx.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://api.mymemory.translated.net/get"
+            params = {"q": text, "langpair": f"autodetect|{target}"}
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+
+        translated = data.get("responseData", {}).get("translatedText")
+        if not translated:
+            await ctx.send("Couldn't translate that — check the language name/code and try again.")
+            return
+
+        embed = discord.Embed(title="🌐 Translation", color=DEFAULT_COLOR)
+        embed.add_field(name="Original", value=text[:1000], inline=False)
+        embed.add_field(name=f"Translated ({target})", value=translated[:1000], inline=False)
+        embed.set_footer(text="ChillBot 😎")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        print(f"Translate error: {e}", flush=True)
+        await ctx.send("Something went wrong translating that, try again.")
+
+
+WORDLE_WORDS = [
+    "apple", "beach", "chair", "dance", "eagle", "flame", "grape", "house",
+    "input", "joker", "knife", "lemon", "mango", "night", "ocean", "piano",
+    "queen", "river", "storm", "tiger", "umbra", "vivid", "world", "xenon",
+    "yield", "zebra", "bread", "cloud", "dream", "earth", "frost", "ghost",
+    "heart", "ideal", "jolly", "koala", "light", "money", "noble", "olive",
+    "power", "quick", "robot", "smile", "train", "unity", "voice", "water",
+]
+
+wordle_games = {}
+
+
+def wordle_feedback(guess, word):
+    result = ["⬛"] * 5
+    word_chars = list(word)
+
+    for i in range(5):
+        if guess[i] == word[i]:
+            result[i] = "🟩"
+            word_chars[i] = None
+
+    for i in range(5):
+        if result[i] == "⬛" and guess[i] in word_chars:
+            result[i] = "🟨"
+            word_chars[word_chars.index(guess[i])] = None
+
+    return result
+
+
+@bot.hybrid_command(name="wordle", description="Play a game of Wordle — guess the 5-letter word in 6 tries")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def wordle(ctx):
+    existing = wordle_games.get(ctx.author.id)
+    if existing and not existing["over"]:
+        await ctx.send(f"You already have a game in progress! You've used {len(existing['guesses'])}/6 guesses. Just type a 5-letter word to guess.")
+        return
+
+    word = random.choice(WORDLE_WORDS)
+    wordle_games[ctx.author.id] = {"word": word, "guesses": [], "over": False}
+
+    embed = discord.Embed(
+        title="🟩 Wordle",
+        description="I picked a 5-letter word! Just type your guess as a normal message (no slash command needed) — you get 6 tries.",
+        color=DEFAULT_COLOR
+    )
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="minesweeper", description="Generate a spoiler-tag minesweeper grid")
+@app_commands.describe(size="Grid size, e.g. 5 for a 5x5 board (default 5, max 8)", bombs="Number of bombs (default 5)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def minesweeper(ctx, size: typing.Optional[int] = 5, bombs: typing.Optional[int] = 5):
+    if size < 3 or size > 8:
+        await ctx.send("Size must be between 3 and 8.")
+        return
+    total_cells = size * size
+    if bombs < 1 or bombs >= total_cells:
+        await ctx.send(f"Bombs must be between 1 and {total_cells - 1}.")
+        return
+
+    bomb_positions = set(random.sample(range(total_cells), bombs))
+    digit_emojis = ["⬛", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+
+    def neighbors(pos):
+        row, col = divmod(pos, size)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                r, c = row + dr, col + dc
+                if 0 <= r < size and 0 <= c < size:
+                    yield r * size + c
+
+    rows_out = []
+    for row in range(size):
+        cells = []
+        for col in range(size):
+            pos = row * size + col
+            if pos in bomb_positions:
+                cells.append("||💣||")
+            else:
+                count = sum(1 for n in neighbors(pos) if n in bomb_positions)
+                cells.append(f"||{digit_emojis[count]}||")
+        rows_out.append("".join(cells))
+
+    grid_text = "\n".join(rows_out)
+    embed = discord.Embed(
+        title="💣 Minesweeper",
+        description=f"{grid_text}\n\n**Bombs:** {bombs} • **Grid:** {size}x{size}",
+        color=DEFAULT_COLOR
+    )
+    embed.set_footer(text="Tap a spoiler to reveal it • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+class HigherLowerView(discord.ui.View):
+    def __init__(self, player_id, deck, current_card):
+        super().__init__(timeout=60)
+        self.player_id = player_id
+        self.deck = deck
+        self.current_card = current_card
+        self.score = 0
+
+    @staticmethod
+    def card_label(card):
+        rank, suit = card
+        return f"{rank}{suit}"
+
+    async def guess(self, interaction: discord.Interaction, direction: str):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+
+        if not self.deck:
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(view=self)
+            return
+
+        next_card = self.deck.pop()
+        current_value = self.current_card[2]
+        next_value = next_card[2]
+
+        correct = (direction == "higher" and next_value > current_value) or \
+                  (direction == "lower" and next_value < current_value) or \
+                  (next_value == current_value)
+
+        if correct:
+            self.score += 1
+            self.current_card = next_card
+            desc = f"**{self.card_label(next_card)}** — Correct! 🎉\nScore: **{self.score}**\n\nNext card, higher or lower than **{self.card_label(next_card)}**?"
+            color = discord.Color.green()
+        else:
+            desc = f"**{self.card_label(next_card)}** — Wrong! 💀\nFinal score: **{self.score}**"
+            color = discord.Color.red()
+            for child in self.children:
+                child.disabled = True
+
+        if not self.deck:
+            for child in self.children:
+                child.disabled = True
+            desc += "\n\n🎉 You cleared the whole deck!"
+
+        embed = discord.Embed(title="🎴 Higher or Lower", description=desc, color=color)
+        embed.set_footer(text="ChillBot 😎")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="⬆️ Higher", style=discord.ButtonStyle.green)
+    async def higher_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.guess(interaction, "higher")
+
+    @discord.ui.button(label="⬇️ Lower", style=discord.ButtonStyle.red)
+    async def lower_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.guess(interaction, "lower")
+
+
+@bot.hybrid_command(name="higher-lower", description="Guess if the next card is higher or lower")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def higher_lower(ctx):
+    ranks = [("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6), ("7", 7), ("8", 8),
+             ("9", 9), ("10", 10), ("J", 11), ("Q", 12), ("K", 13), ("A", 14)]
+    suits = ["♠️", "♥️", "♦️", "♣️"]
+    deck = [(rank, suit, value) for rank, value in ranks for suit in suits]
+    random.shuffle(deck)
+
+    current_card = deck.pop()
+    view = HigherLowerView(ctx.author.id, deck, current_card)
+
+    embed = discord.Embed(
+        title="🎴 Higher or Lower",
+        description=f"Current card: **{current_card[0]}{current_card[1]}**\n\nWill the next card be higher or lower?",
+        color=DEFAULT_COLOR
+    )
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed, view=view)
+
+
+class Connect4View(discord.ui.View):
+    def __init__(self, player1_id, player2_id):
+        super().__init__(timeout=300)
+        self.player1_id = player1_id
+        self.player2_id = player2_id
+        self.board = [[0] * 7 for _ in range(6)]  # 0 empty, 1 player1, 2 player2
+        self.turn = player1_id
+        self.over = False
+
+        for col in range(7):
+            self.add_item(Connect4Button(col))
+
+    def render_board(self):
+        symbols = {0: "⚪", 1: "🔴", 2: "🟡"}
+        lines = []
+        for row in self.board:
+            lines.append("".join(symbols[cell] for cell in row))
+        return "\n".join(lines)
+
+    def drop_piece(self, col, player_num):
+        for row in range(5, -1, -1):
+            if self.board[row][col] == 0:
+                self.board[row][col] = player_num
+                return row
+        return None
+
+    def check_winner(self, player_num):
+        board = self.board
+        for r in range(6):
+            for c in range(4):
+                if all(board[r][c + i] == player_num for i in range(4)):
+                    return True
+        for r in range(3):
+            for c in range(7):
+                if all(board[r + i][c] == player_num for i in range(4)):
+                    return True
+        for r in range(3):
+            for c in range(4):
+                if all(board[r + i][c + i] == player_num for i in range(4)):
+                    return True
+        for r in range(3, 6):
+            for c in range(4):
+                if all(board[r - i][c + i] == player_num for i in range(4)):
+                    return True
+        return False
+
+    def is_full(self):
+        return all(self.board[0][c] != 0 for c in range(7))
+
+
+class Connect4Button(discord.ui.Button):
+    def __init__(self, col):
+        super().__init__(label=str(col + 1), style=discord.ButtonStyle.blurple, row=col // 4)
+        self.col = col
+
+    async def callback(self, interaction: discord.Interaction):
+        view: Connect4View = self.view
+
+        if view.over:
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+        if interaction.user.id != view.turn:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        player_num = 1 if interaction.user.id == view.player1_id else 2
+        row = view.drop_piece(self.col, player_num)
+        if row is None:
+            await interaction.response.send_message("That column is full!", ephemeral=True)
+            return
+
+        if row == 0:
+            self.disabled = True
+
+        if view.check_winner(player_num):
+            view.over = True
+            for child in view.children:
+                child.disabled = True
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{view.render_board()}\n\n🎉 <@{interaction.user.id}> wins!",
+                color=discord.Color.green()
+            )
+            await interaction.response.edit_message(embed=embed, view=view)
+            return
+
+        if view.is_full():
+            view.over = True
+            for child in view.children:
+                child.disabled = True
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{view.render_board()}\n\n🤝 It's a draw!",
+                color=discord.Color.orange()
+            )
+            await interaction.response.edit_message(embed=embed, view=view)
+            return
+
+        view.turn = view.player2_id if interaction.user.id == view.player1_id else view.player1_id
+        embed = discord.Embed(
+            title="🔴 🟡 Connect 4",
+            description=f"{view.render_board()}\n\nIt's <@{view.turn}>'s turn.",
+            color=DEFAULT_COLOR
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+@bot.hybrid_command(name="connect4", description="Play Connect 4 against a friend")
+@app_commands.describe(opponent="Who do you want to challenge?")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def connect4(ctx, opponent: discord.Member):
+    if opponent.bot:
+        await ctx.send("You can't challenge a bot to this game.")
+        return
+    if opponent.id == ctx.author.id:
+        await ctx.send("You can't challenge yourself!")
+        return
+
+    view = Connect4View(ctx.author.id, opponent.id)
+    embed = discord.Embed(
+        title="🔴 🟡 Connect 4",
+        description=f"{view.render_board()}\n\n{ctx.author.mention} (🔴) vs {opponent.mention} (🟡)\n\nIt's {ctx.author.mention}'s turn.",
+        color=DEFAULT_COLOR
+    )
+    await ctx.send(embed=embed, view=view)
 
 
 # ---------- MENTION HANDLING ----------
@@ -901,6 +1581,42 @@ async def on_message(message):
         if bot.user in message.mentions:
             await handle_mention(message)
             return
+
+        if message.author.id in wordle_games and not wordle_games[message.author.id]["over"]:
+            content = message.content.strip().lower()
+            if len(content) == 5 and content.isalpha():
+                game = wordle_games[message.author.id]
+                feedback = wordle_feedback(content, game["word"])
+                game["guesses"].append((content, feedback))
+
+                board_text = "\n".join(
+                    f"{' '.join(fb)}\n{' '.join(g.upper())}" for g, fb in game["guesses"]
+                )
+
+                if content == game["word"]:
+                    game["over"] = True
+                    embed = discord.Embed(
+                        title="🟩 Wordle — You Won!",
+                        description=f"{board_text}\n\n🎉 You guessed it in {len(game['guesses'])}/6 tries!",
+                        color=discord.Color.green()
+                    )
+                    await message.channel.send(embed=embed)
+                elif len(game["guesses"]) >= 6:
+                    game["over"] = True
+                    embed = discord.Embed(
+                        title="🟩 Wordle — Out of Tries",
+                        description=f"{board_text}\n\nThe word was **{game['word'].upper()}**. Try `/wordle` again!",
+                        color=discord.Color.red()
+                    )
+                    await message.channel.send(embed=embed)
+                else:
+                    embed = discord.Embed(
+                        title=f"🟩 Wordle — Guess {len(game['guesses'])}/6",
+                        description=board_text,
+                        color=DEFAULT_COLOR
+                    )
+                    await message.channel.send(embed=embed)
+                return
 
         if message.guild:
             for gid, gw in giveaways.items():
