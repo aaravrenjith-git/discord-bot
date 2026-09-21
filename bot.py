@@ -964,6 +964,8 @@ EIGHT_BALL_ANSWERS = [
 
 @bot.hybrid_command(name="8ball", description="Ask the magic 8-ball a question")
 @app_commands.describe(question="What do you want to ask?")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def eight_ball(ctx, *, question: str):
     embed = discord.Embed(
         title="🎱 Magic 8-Ball",
