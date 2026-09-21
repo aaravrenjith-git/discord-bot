@@ -1,5 +1,6 @@
 import os
 import random
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -7,6 +8,7 @@ import typing
 import re
 import datetime
 import aiohttp
+import certifi
 from flask import Flask
 from threading import Thread
 from pymongo import MongoClient
@@ -49,7 +51,7 @@ OWNER_REPLIES = [
 
 # ---------- DATABASE ----------
 
-mongo_client = MongoClient(os.environ["MONGODB_URI"])
+mongo_client = MongoClient(os.environ["MONGODB_URI"], tlsCAFile=certifi.where(), serverSelectionTimeoutMS=8000)
 db = mongo_client["chillbot"]
 giveaways_col = db["giveaways"]
 settings_col = db["settings"]
@@ -86,17 +88,30 @@ def save_giveaway(gid):
         "active": gw["active"],
         "end_time": gw["end_time"].isoformat(),
     }
+
+    def _write():
+        try:
+            giveaways_col.replace_one({"_id": gid}, doc, upsert=True)
+        except Exception as e:
+            print(f"DB save_giveaway error: {e}", flush=True)
+
     try:
-        giveaways_col.replace_one({"_id": gid}, doc, upsert=True)
+        bot.loop.run_in_executor(None, _write)
     except Exception as e:
-        print(f"DB save_giveaway error: {e}", flush=True)
+        print(f"DB save_giveaway schedule error: {e}", flush=True)
 
 
 def delete_giveaway_doc(gid):
+    def _delete():
+        try:
+            giveaways_col.delete_one({"_id": gid})
+        except Exception as e:
+            print(f"DB delete_giveaway error: {e}", flush=True)
+
     try:
-        giveaways_col.delete_one({"_id": gid})
+        bot.loop.run_in_executor(None, _delete)
     except Exception as e:
-        print(f"DB delete_giveaway error: {e}", flush=True)
+        print(f"DB delete_giveaway schedule error: {e}", flush=True)
 
 
 def save_settings(guild_id):
@@ -111,64 +126,72 @@ def save_settings(guild_id):
         "default_ping_role": default_ping_roles.get(guild_id),
         "embed_color": embed_colors.get(guild_id),
     }
-    try:
-        settings_col.replace_one({"_id": guild_id}, doc, upsert=True)
-    except Exception as e:
-        print(f"DB save_settings error: {e}", flush=True)
 
-
-async def load_all_data():
-    """Loads settings and resumes active giveaways from MongoDB on startup."""
-    try:
-        for doc in settings_col.find({}):
-            guild_id = doc["_id"]
-            authorized_roles[guild_id] = set(doc.get("authorized_roles", []))
-            blacklisted_roles[guild_id] = set(doc.get("blacklisted_roles", []))
-            entry_channels[guild_id] = set(doc.get("entry_channels", []))
-            multiplier_roles[guild_id] = {int(k): v for k, v in doc.get("multiplier_roles", {}).items()}
-            win_counts[guild_id] = {int(k): v for k, v in doc.get("win_counts", {}).items()}
-            if doc.get("log_channel"):
-                log_channels[guild_id] = doc["log_channel"]
-            if doc.get("default_ping_role"):
-                default_ping_roles[guild_id] = doc["default_ping_role"]
-            if doc.get("embed_color"):
-                embed_colors[guild_id] = doc["embed_color"]
-        print("Loaded settings from database.", flush=True)
-    except Exception as e:
-        print(f"DB load settings error: {e}", flush=True)
+    def _write():
+        try:
+            settings_col.replace_one({"_id": guild_id}, doc, upsert=True)
+        except Exception as e:
+            print(f"DB save_settings error: {e}", flush=True)
 
     try:
-        for doc in giveaways_col.find({"active": True}):
-            gid = doc["_id"]
-            end_time = datetime.datetime.fromisoformat(doc["end_time"])
-
-            giveaways[gid] = {
-                "channel_id": doc["channel_id"],
-                "guild_id": doc["guild_id"],
-                "host_id": doc["host_id"],
-                "prize": doc["prize"],
-                "winners": doc["winners"],
-                "required_role_id": doc.get("required_role_id"),
-                "blacklist_role_id": doc.get("blacklist_role_id"),
-                "bypass_role_id": doc.get("bypass_role_id"),
-                "joined_users": set(doc.get("joined_users", [])),
-                "entries": doc.get("entries", []),
-                "active": True,
-                "end_time": end_time,
-            }
-
-            view = GiveawayView(gid)
-            bot.add_view(view, message_id=gid)
-
-            now = datetime.datetime.now(datetime.timezone.utc)
-            if end_time <= now:
-                bot.loop.create_task(end_giveaway(gid))
-            else:
-                bot.loop.create_task(resume_giveaway_timer(gid, end_time))
-
-        print(f"Resumed {len(giveaways)} active giveaway(s) from database.", flush=True)
+        bot.loop.run_in_executor(None, _write)
     except Exception as e:
-        print(f"DB load giveaways error: {e}", flush=True)
+        print(f"DB save_settings schedule error: {e}", flush=True)
+
+
+def fetch_all_data_sync():
+    """Blocking MongoDB reads — safe to run in a background thread."""
+    settings_docs = list(settings_col.find({}))
+    giveaway_docs = list(giveaways_col.find({"active": True}))
+    return settings_docs, giveaway_docs
+
+
+async def apply_loaded_data(settings_docs, giveaway_docs):
+    """Takes raw DB documents and rebuilds bot state + Discord views on the main event loop."""
+    for doc in settings_docs:
+        guild_id = doc["_id"]
+        authorized_roles[guild_id] = set(doc.get("authorized_roles", []))
+        blacklisted_roles[guild_id] = set(doc.get("blacklisted_roles", []))
+        entry_channels[guild_id] = set(doc.get("entry_channels", []))
+        multiplier_roles[guild_id] = {int(k): v for k, v in doc.get("multiplier_roles", {}).items()}
+        win_counts[guild_id] = {int(k): v for k, v in doc.get("win_counts", {}).items()}
+        if doc.get("log_channel"):
+            log_channels[guild_id] = doc["log_channel"]
+        if doc.get("default_ping_role"):
+            default_ping_roles[guild_id] = doc["default_ping_role"]
+        if doc.get("embed_color"):
+            embed_colors[guild_id] = doc["embed_color"]
+    print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
+
+    for doc in giveaway_docs:
+        gid = doc["_id"]
+        end_time = datetime.datetime.fromisoformat(doc["end_time"])
+
+        giveaways[gid] = {
+            "channel_id": doc["channel_id"],
+            "guild_id": doc["guild_id"],
+            "host_id": doc["host_id"],
+            "prize": doc["prize"],
+            "winners": doc["winners"],
+            "required_role_id": doc.get("required_role_id"),
+            "blacklist_role_id": doc.get("blacklist_role_id"),
+            "bypass_role_id": doc.get("bypass_role_id"),
+            "joined_users": set(doc.get("joined_users", [])),
+            "entries": doc.get("entries", []),
+            "active": True,
+            "end_time": end_time,
+        }
+
+        view = GiveawayView(gid)
+        bot.add_view(view, message_id=gid)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if end_time <= now:
+            bot.loop.create_task(end_giveaway(gid))
+        else:
+            bot.loop.create_task(resume_giveaway_timer(gid, end_time))
+
+    print(f"Resumed {len(giveaway_docs)} active giveaway(s) from database.", flush=True)
 
 
 async def resume_giveaway_timer(gid, end_time):
@@ -402,12 +425,18 @@ class GiveawayView(discord.ui.View):
 async def on_ready():
     print(f"Logged in as {bot.user}", flush=True)
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for /start-giveaway 🎉"))
-    await load_all_data()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)", flush=True)
     except Exception as e:
         print(f"Slash command sync failed: {e}", flush=True)
+    try:
+        settings_docs, giveaway_docs = await asyncio.wait_for(asyncio.to_thread(fetch_all_data_sync), timeout=15)
+        await apply_loaded_data(settings_docs, giveaway_docs)
+    except asyncio.TimeoutError:
+        print("Loading data from database timed out — continuing without it. Check MONGODB_URI / Atlas network access.", flush=True)
+    except Exception as e:
+        print(f"load_all_data error: {e}", flush=True)
 
 
 @bot.event
@@ -432,6 +461,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ---------- HELP COMMAND ----------
 
 @bot.hybrid_command(name="help", description="Show all ChillBot commands and what they do")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def help_cmd(ctx):
     embed = discord.Embed(
         title="😎 ChillBot — Help",
@@ -444,6 +475,8 @@ async def help_cmd(ctx):
         value=(
             "**/start-giveaway** — Create a new giveaway with a join button\n"
             "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
+            "**/cancel-giveaway** — Cancel a running giveaway without picking a winner\n"
+            "**/edit-giveaway** — Fix a mistake in a running giveaway\n"
             "**/remove-participant** — Kick someone out of a giveaway\n"
         ),
         inline=False
@@ -455,7 +488,10 @@ async def help_cmd(ctx):
     )
     embed.add_field(
         name="⚙️ Admin Only",
-        value="**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel",
+        value=(
+            "**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel\n"
+            "**/embed** — Send a custom embed message"
+        ),
         inline=False
     )
     embed.add_field(
@@ -488,6 +524,7 @@ async def help_cmd(ctx):
 # ---------- SETUP COMMAND ----------
 
 @bot.tree.command(name="setup", description="[Admin] Configure giveaway roles, channels, ping role, embed color, and logs")
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.describe(
@@ -777,6 +814,12 @@ async def end_giveaway(giveaway_id):
     if not gw or not gw["active"]:
         return
 
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if now < gw["end_time"]:
+        # end_time was pushed later (e.g. via /edit-giveaway) — wait again instead of ending early
+        bot.loop.create_task(resume_giveaway_timer(giveaway_id, gw["end_time"]))
+        return
+
     gw["active"] = False
     channel = bot.get_channel(gw["channel_id"])
     if channel is None:
@@ -914,8 +957,199 @@ async def remove_participant(ctx, message_id: str, member: discord.Member):
     await send_log(ctx.guild, log_embed)
 
 
-@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")
-async def leaderboard(ctx):
+@bot.hybrid_command(name="cancel-giveaway", description="Cancel a running giveaway without picking a winner")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post")
+async def cancel_giveaway(ctx, message_id: str):
+    if not can_manage_giveaways(ctx.author):
+        await ctx.send("You don't have permission to cancel giveaways.")
+        return
+    try:
+        gid = int(message_id)
+    except ValueError:
+        await ctx.send("That doesn't look like a valid giveaway ID.")
+        return
+
+    gw = giveaways.get(gid)
+    if not gw or not gw["active"]:
+        await ctx.send("No active giveaway found with that ID.")
+        return
+
+    if gw["host_id"] != ctx.author.id and not is_admin_or_owner(ctx.author):
+        allowed = authorized_roles.get(ctx.guild.id, set())
+        user_role_ids = {r.id for r in ctx.author.roles}
+        if not (allowed & user_role_ids):
+            await ctx.send("You can only cancel giveaways you hosted, unless you're an admin or authorized role.")
+            return
+
+    gw["active"] = False
+    channel = bot.get_channel(gw["channel_id"])
+
+    embed = discord.Embed(
+        title="🚫 Giveaway Cancelled",
+        description=f"**Prize:** {gw['prize']}\n\nThis giveaway was cancelled by {ctx.author.mention} — no winner was picked.",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"Giveaway ID: {gid} • ChillBot 😎")
+
+    if channel:
+        try:
+            msg = await channel.fetch_message(gid)
+            await msg.edit(embed=embed, view=None)
+        except Exception:
+            await channel.send(embed=embed)
+
+    delete_giveaway_doc(gid)
+    giveaways.pop(gid, None)
+    await ctx.send("Giveaway cancelled.")
+
+    log_embed = discord.Embed(
+        title="🚫 Giveaway Cancelled",
+        description=f"Cancelled by {ctx.author.mention}, no winner picked",
+        color=discord.Color.red()
+    )
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="edit-giveaway", description="Fix a mistake in a running giveaway")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post",
+    prize="New prize text (leave blank to keep current)",
+    duration="New remaining time from now, e.g. 30m, 1h, 2d (leave blank to keep current end time)",
+    winners="New number of winners (leave blank to keep current)"
+)
+async def edit_giveaway(
+    ctx,
+    message_id: str,
+    prize: typing.Optional[str] = None,
+    duration: typing.Optional[str] = None,
+    winners: typing.Optional[int] = None,
+):
+    if not can_manage_giveaways(ctx.author):
+        await ctx.send("You don't have permission to edit giveaways.")
+        return
+    try:
+        gid = int(message_id)
+    except ValueError:
+        await ctx.send("That doesn't look like a valid giveaway ID.")
+        return
+
+    gw = giveaways.get(gid)
+    if not gw or not gw["active"]:
+        await ctx.send("No active giveaway found with that ID.")
+        return
+
+    if gw["host_id"] != ctx.author.id and not is_admin_or_owner(ctx.author):
+        allowed = authorized_roles.get(ctx.guild.id, set())
+        user_role_ids = {r.id for r in ctx.author.roles}
+        if not (allowed & user_role_ids):
+            await ctx.send("You can only edit giveaways you hosted, unless you're an admin or authorized role.")
+            return
+
+    if prize:
+        if len(prize) > 200:
+            await ctx.send("Prize text is too long (max 200 characters).")
+            return
+        gw["prize"] = prize
+
+    if duration:
+        seconds = parse_duration(duration)
+        if seconds is None:
+            await ctx.send("Invalid duration. Use formats like `30m`, `1h`, `2d`, or `1h30m`.")
+            return
+        gw["end_time"] = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+
+    if winners:
+        if winners < 1 or winners > 20:
+            await ctx.send("Winners must be between 1 and 20.")
+            return
+        gw["winners"] = winners
+
+    save_giveaway(gid)
+
+    channel = bot.get_channel(gw["channel_id"])
+    if channel:
+        try:
+            msg = await channel.fetch_message(gid)
+            timestamp = discord.utils.format_dt(gw["end_time"], style="R")
+            embed = msg.embeds[0]
+            embed.description = f"✨ **{gw['prize']}** ✨\n\nClick **🎉 Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n*Click Join again anytime to leave.*"
+            for i, field in enumerate(embed.fields):
+                if field.name == "⏰ Ends":
+                    embed.set_field_at(i, name="⏰ Ends", value=timestamp, inline=True)
+                elif field.name == "🏆 Winners":
+                    embed.set_field_at(i, name="🏆 Winners", value=str(gw["winners"]), inline=True)
+            await msg.edit(embed=embed)
+        except Exception as e:
+            print(f"Edit giveaway message error: {e}", flush=True)
+
+    await ctx.send("✅ Giveaway updated.")
+
+    log_embed = discord.Embed(
+        title="✏️ Giveaway Edited",
+        description=f"Edited by {ctx.author.mention}",
+        color=discord.Color.orange()
+    )
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="embed", description="[Admin] Send a custom embed message")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    title="The embed's title",
+    description="The embed's main text",
+    color="Optional hex color, e.g. #FF5733 (defaults to this server's embed color)",
+    channel="Optional channel to send it to (defaults to the current channel)"
+)
+async def embed_cmd(
+    ctx,
+    title: str,
+    description: str,
+    color: typing.Optional[str] = None,
+    channel: typing.Optional[discord.TextChannel] = None,
+):
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.")
+        return
+
+    if len(title) > 256:
+        await ctx.send("Title is too long (max 256 characters).")
+        return
+    if len(description) > 4000:
+        await ctx.send("Description is too long (max 4000 characters).")
+        return
+
+    embed_color = get_guild_color(ctx.guild.id)
+    if color:
+        if not re.match(r"^#?[0-9A-Fa-f]{6}$", color):
+            await ctx.send("Invalid hex color. Use a format like #FF5733.")
+            return
+        embed_color = discord.Color.from_str(color if color.startswith("#") else f"#{color}")
+
+    embed = discord.Embed(title=title, description=description, color=embed_color)
+    embed.set_footer(text="ChillBot 😎")
+
+    target_channel = channel or ctx.channel
+    try:
+        await target_channel.send(embed=embed)
+        if target_channel.id != ctx.channel.id:
+            await ctx.send(f"✅ Sent to {target_channel.mention}.")
+        else:
+            await ctx.send("✅ Sent.")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to send messages in that channel.")
+
+
+@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")async def leaderboard(ctx):
     guild_wins = win_counts.get(ctx.guild.id, {})
     if not guild_wins:
         await ctx.send("No giveaways have been won yet in this server.")
