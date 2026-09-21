@@ -1149,7 +1149,8 @@ async def embed_cmd(
         await ctx.send("I don't have permission to send messages in that channel.")
 
 
-@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")async def leaderboard(ctx):
+@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")
+async def leaderboard(ctx):
     guild_wins = win_counts.get(ctx.guild.id, {})
     if not guild_wins:
         await ctx.send("No giveaways have been won yet in this server.")
