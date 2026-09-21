@@ -7,6 +7,8 @@ from discord.ext import commands
 import typing
 import re
 import datetime
+import time
+import html
 import aiohttp
 import certifi
 from flask import Flask
@@ -55,6 +57,7 @@ mongo_client = MongoClient(os.environ["MONGODB_URI"], tlsCAFile=certifi.where(),
 db = mongo_client["chillbot"]
 giveaways_col = db["giveaways"]
 settings_col = db["settings"]
+users_col = db["users"]
 
 # ---------- DATA STORES (in memory, backed by MongoDB) ----------
 
@@ -67,6 +70,16 @@ win_counts = {}
 log_channels = {}
 default_ping_roles = {}
 embed_colors = {}
+jail_roles = {}
+
+# economy / levels: economy[guild_id][user_id] = {...}, saved to MongoDB in batches
+economy = {}
+economy_dirty = set()
+economy_loaded = False
+economy_tasks_started = False
+jail_tasks = {}
+xp_cooldowns = {}
+active_trivia = set()
 
 
 def save_giveaway(gid):
@@ -125,6 +138,7 @@ def save_settings(guild_id):
         "log_channel": log_channels.get(guild_id),
         "default_ping_role": default_ping_roles.get(guild_id),
         "embed_color": embed_colors.get(guild_id),
+        "jail_role": jail_roles.get(guild_id),
     }
 
     def _write():
@@ -143,7 +157,8 @@ def fetch_all_data_sync():
     """Blocking MongoDB reads — safe to run in a background thread."""
     settings_docs = list(settings_col.find({}))
     giveaway_docs = list(giveaways_col.find({"active": True}))
-    return settings_docs, giveaway_docs
+    user_docs = list(users_col.find({}))
+    return settings_docs, giveaway_docs, user_docs
 
 
 async def apply_loaded_data(settings_docs, giveaway_docs):
@@ -161,6 +176,8 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
             default_ping_roles[guild_id] = doc["default_ping_role"]
         if doc.get("embed_color"):
             embed_colors[guild_id] = doc["embed_color"]
+        if doc.get("jail_role"):
+            jail_roles[guild_id] = doc["jail_role"]
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -473,12 +490,14 @@ async def on_ready():
     except Exception as e:
         print(f"Slash command sync failed: {e}", flush=True)
     try:
-        settings_docs, giveaway_docs = await asyncio.wait_for(asyncio.to_thread(fetch_all_data_sync), timeout=15)
+        settings_docs, giveaway_docs, user_docs = await asyncio.wait_for(asyncio.to_thread(fetch_all_data_sync), timeout=15)
         await apply_loaded_data(settings_docs, giveaway_docs)
+        await apply_user_data(user_docs)
     except asyncio.TimeoutError:
         print("Loading data from database timed out — continuing without it. Check MONGODB_URI / Atlas network access.", flush=True)
     except Exception as e:
         print(f"load_all_data error: {e}", flush=True)
+    start_economy_tasks()
 
 
 @bot.event
@@ -509,7 +528,7 @@ async def help_cmd(ctx):
     embed = discord.Embed(
         title="😎 ChillBot — Help",
         description="Your all-in-one giveaway bot. Here's everything you can do:",
-        color=get_guild_color(ctx.guild.id)
+        color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.add_field(
@@ -525,13 +544,32 @@ async def help_cmd(ctx):
     )
     embed.add_field(
         name="🏆 Everyone",
-        value="**/leaderboard** — See who's won the most giveaways in this server",
+        value="**/leaderboard** — See the top members: richest, highest level, trivia champs, or giveaway winners",
+        inline=False
+    )
+    embed.add_field(
+        name="💰 Economy & Levels",
+        value=(
+            "**/balance** — Check how many coins you (or someone else) have\n"
+            "**/daily** — Claim a free reward every 24 hours (streaks pay more!)\n"
+            "**/work** — Do a mini-job to earn extra coins\n"
+            "**/rank** — See your level card and XP progress bar\n"
+            "**/trivia** — Start a multiple-choice quiz for points and coins"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🚔 Moderators",
+        value=(
+            "**/jail** — Give a member the jailed role for a set time\n"
+            "**/unjail** — Let someone out of jail early"
+        ),
         inline=False
     )
     embed.add_field(
         name="⚙️ Admin Only",
         value=(
-            "**/setup** — Configure host roles, blacklist, channels, ping role, embed color, and log channel\n"
+            "**/setup** — Configure host roles, blacklist, channels, ping role, jailed role, embed color, and log channel\n"
             "**/embed** — Send a custom embed message"
         ),
         inline=False
@@ -565,7 +603,7 @@ async def help_cmd(ctx):
 
 # ---------- SETUP COMMAND ----------
 
-@bot.tree.command(name="setup", description="[Admin] Configure giveaway roles, channels, ping role, embed color, and logs")
+@bot.tree.command(name="setup", description="[Admin] Configure giveaway roles, channels, ping role, jailed role, embed color, and logs")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -587,6 +625,8 @@ async def help_cmd(ctx):
     app_commands.Choice(name="✖️ Remove a role's bonus entries", value="remove_multiplier"),
     app_commands.Choice(name="📣 Set a default role to ping on new giveaways", value="set_ping_role"),
     app_commands.Choice(name="🔇 Remove the default ping role", value="remove_ping_role"),
+    app_commands.Choice(name="🔒 Set the jailed role (used by /jail)", value="set_jail_role"),
+    app_commands.Choice(name="🔓 Remove the jailed role", value="remove_jail_role"),
     app_commands.Choice(name="🎨 Set a custom embed color", value="set_embed_color"),
     app_commands.Choice(name="🎨 Reset embed color to default", value="reset_embed_color"),
     app_commands.Choice(name="📝 Set the log channel", value="set_log_channel"),
@@ -610,7 +650,7 @@ async def setup_cmd(
         await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
         return
 
-    if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role") and not role:
+    if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role", "set_jail_role") and not role:
         await interaction.response.send_message("Please pick a role for this action.", ephemeral=True)
         return
     if act in ("add_channel", "remove_channel", "set_log_channel") and not channel:
@@ -678,6 +718,28 @@ async def setup_cmd(
         save_settings(guild_id)
         await interaction.response.send_message("❌ Default ping role removed.", ephemeral=True)
 
+    elif act == "set_jail_role":
+        if role.is_default():
+            await interaction.response.send_message("You can't use @everyone as the jailed role — pick or create a dedicated role.", ephemeral=True)
+            return
+        jail_roles[guild_id] = role.id
+        save_settings(guild_id)
+        reply = f"🔒 {role.mention} is now the jailed role. Moderators can use **/jail** to send members there."
+        if role.managed or role >= interaction.guild.me.top_role:
+            reply += (
+                "\n⚠️ I can't hand out this role yet — in Server Settings → Roles, drag my role above it "
+                "(and make sure I have **Manage Roles**)."
+            )
+        reply += "\n💡 Tip: edit this role's permissions (or your channel permissions) so jailed members can't chat or see other channels."
+        await interaction.response.send_message(reply, ephemeral=True)
+
+    elif act == "remove_jail_role":
+        jail_roles.pop(guild_id, None)
+        save_settings(guild_id)
+        await interaction.response.send_message(
+            "🔓 Jailed role removed. Anyone already jailed keeps the role until their time is up.", ephemeral=True
+        )
+
     elif act == "set_embed_color":
         hex_clean = color if color.startswith("#") else f"#{color}"
         embed_colors[guild_id] = hex_clean
@@ -706,6 +768,7 @@ async def setup_cmd(
         chans = entry_channels.get(guild_id, set())
         mults = multiplier_roles.get(guild_id, {})
         ping_role_id = default_ping_roles.get(guild_id)
+        jail_role_id = jail_roles.get(guild_id)
         log_channel_id = log_channels.get(guild_id)
         color_hex = embed_colors.get(guild_id, "Default")
 
@@ -714,6 +777,7 @@ async def setup_cmd(
         chans_txt = ", ".join(f"<#{c}>" for c in chans) or "Default (each giveaway's own channel)"
         mults_txt = ", ".join(f"<@&{r}> ({m}x)" for r, m in mults.items()) or "None"
         ping_txt = f"<@&{ping_role_id}>" if ping_role_id else "None"
+        jail_txt = f"<@&{jail_role_id}>" if jail_role_id else "Not set"
         log_txt = f"<#{log_channel_id}>" if log_channel_id else "Not set"
 
         embed = discord.Embed(title="⚙️ Giveaway Settings", color=get_guild_color(guild_id))
@@ -723,6 +787,7 @@ async def setup_cmd(
         embed.add_field(name="Channels that count entries", value=chans_txt, inline=False)
         embed.add_field(name="Bonus entry roles", value=mults_txt, inline=False)
         embed.add_field(name="Default ping role", value=ping_txt, inline=True)
+        embed.add_field(name="Jailed role", value=jail_txt, inline=True)
         embed.add_field(name="Embed color", value=color_hex, inline=True)
         embed.add_field(name="Log channel", value=log_txt, inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1191,28 +1256,813 @@ async def embed_cmd(
         await ctx.send("I don't have permission to send messages in that channel.")
 
 
-@bot.hybrid_command(name="leaderboard", description="See who's won the most giveaways in this server")
-async def leaderboard(ctx):
-    guild_wins = win_counts.get(ctx.guild.id, {})
-    if not guild_wins:
-        await ctx.send("No giveaways have been won yet in this server.")
+# ---------- ECONOMY, LEVELS, TRIVIA & JAIL ----------
+
+COIN = "🪙"
+MEDALS = ["🥇", "🥈", "🥉"]
+XP_COOLDOWN = 60            # seconds between messages that give XP
+DAILY_BASE = 100
+DAILY_STREAK_BONUS = 25     # extra coins per streak day (up to 10 extra days)
+WORK_COOLDOWN = 3600        # 1 hour
+TRIVIA_SECONDS = 20         # time to answer each question
+TRIVIA_BONUS = [5, 3, 1]    # speed bonus for the 1st, 2nd and 3rd correct answer
+JAIL_MAX_SECONDS = 30 * 86400
+
+DEFAULT_USER = {
+    "coins": 0,
+    "xp": 0,
+    "last_daily": 0.0,
+    "streak": 0,
+    "last_work": 0.0,
+    "trivia_points": 0,
+    "jailed_until": None,
+    "jail_role_id": None,
+}
+
+
+def get_user(guild_id, user_id):
+    users = economy.setdefault(guild_id, {})
+    u = users.get(user_id)
+    if u is None:
+        u = dict(DEFAULT_USER)
+        users[user_id] = u
+    return u
+
+
+def mark_dirty(guild_id, user_id):
+    economy_dirty.add((guild_id, user_id))
+
+
+def xp_for_next(level):
+    """XP needed to go from `level` to `level + 1`."""
+    return 5 * level * level + 50 * level + 100
+
+
+def level_from_xp(xp):
+    """Returns (level, xp earned inside this level, xp needed for the next level)."""
+    level = 0
+    while xp >= xp_for_next(level):
+        xp -= xp_for_next(level)
+        level += 1
+    return level, xp, xp_for_next(level)
+
+
+def progress_bar(current, needed, length=12):
+    filled = int(length * current / needed) if needed else 0
+    filled = max(0, min(length, filled))
+    return "▰" * filled + "▱" * (length - filled)
+
+
+def rank_position(guild_id, user_id, key):
+    users = economy.get(guild_id, {})
+    ranked = sorted(
+        ((uid, u[key]) for uid, u in users.items() if u[key] > 0),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    for i, (uid, _) in enumerate(ranked, start=1):
+        if uid == user_id:
+            return i
+    return None
+
+
+def fmt_ts(ts, style="R"):
+    return f"<t:{int(ts)}:{style}>"
+
+
+# ----- saving / loading -----
+
+def flush_economy_sync(batch):
+    """Blocking MongoDB writes — runs in a background thread."""
+    for doc in batch:
+        users_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+
+
+async def economy_flush_loop():
+    while True:
+        await asyncio.sleep(15)
+        # never write before the saved data has been loaded, or we could overwrite it with blanks
+        if not economy_loaded or not economy_dirty:
+            continue
+        keys = list(economy_dirty)
+        economy_dirty.clear()
+        batch = []
+        for gid, uid in keys:
+            u = economy.get(gid, {}).get(uid)
+            if u is not None:
+                doc = {"_id": f"{gid}:{uid}", "guild_id": gid, "user_id": uid}
+                doc.update(u)
+                batch.append(doc)
+        try:
+            await asyncio.to_thread(flush_economy_sync, batch)
+        except Exception as e:
+            print(f"DB economy flush error: {e}", flush=True)
+            economy_dirty.update(keys)
+
+
+def start_economy_tasks():
+    global economy_tasks_started
+    if economy_tasks_started:
+        return
+    economy_tasks_started = True
+    asyncio.create_task(economy_flush_loop())
+
+
+async def apply_user_data(user_docs):
+    global economy_loaded
+    if economy_loaded:
+        return
+    now = time.time()
+    for doc in user_docs:
+        gid = doc["guild_id"]
+        uid = doc["user_id"]
+        u = dict(DEFAULT_USER)
+        for key in DEFAULT_USER:
+            if key in doc:
+                u[key] = doc[key]
+        economy.setdefault(gid, {})[uid] = u
+
+        until = u.get("jailed_until")
+        if until:
+            if until <= now:
+                asyncio.create_task(release_jail(gid, uid))
+            else:
+                schedule_jail_release(gid, uid, until)
+    economy_loaded = True
+    print(f"Loaded economy data for {len(user_docs)} member(s) from database.", flush=True)
+
+
+# ----- XP from chatting -----
+
+async def economy_on_message(message):
+    try:
+        if message.author.bot or not message.guild:
+            return
+        if message.content.startswith("?"):
+            return
+
+        key = (message.guild.id, message.author.id)
+        now = time.time()
+        if now - xp_cooldowns.get(key, 0) < XP_COOLDOWN:
+            return
+        xp_cooldowns[key] = now
+
+        u = get_user(*key)
+        old_level = level_from_xp(u["xp"])[0]
+        u["xp"] += random.randint(15, 25)
+        new_level = level_from_xp(u["xp"])[0]
+
+        reward = 0
+        if new_level > old_level:
+            reward = new_level * 20
+            u["coins"] += reward
+        mark_dirty(*key)
+
+        if reward:
+            await message.channel.send(
+                f"🎉 {message.author.mention} reached **level {new_level}**! (+{reward} {COIN})",
+                delete_after=20
+            )
+    except Exception as e:
+        print(f"economy_on_message error: {e}", flush=True)
+
+
+# ----- leaderboard -----
+
+@bot.hybrid_command(name="leaderboard", description="See the top members: richest, highest level, trivia champs, or giveaway winners")
+@app_commands.describe(category="What to rank people by (default: coins)")
+async def leaderboard(ctx, category: typing.Literal["coins", "levels", "trivia", "giveaway-wins"] = "coins"):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
         return
 
-    sorted_wins = sorted(guild_wins.items(), key=lambda x: x[1], reverse=True)[:10]
+    gid = ctx.guild.id
+    users = economy.get(gid, {})
 
-    medals = ["🥇", "🥈", "🥉"]
+    if category == "coins":
+        title = f"{COIN} Richest Members"
+        data = {uid: u["coins"] for uid, u in users.items() if u["coins"] > 0}
+
+        def fmt(value):
+            return f"**{value:,}** {COIN}"
+    elif category == "levels":
+        title = "⭐ Highest Level Members"
+        data = {uid: u["xp"] for uid, u in users.items() if u["xp"] > 0}
+
+        def fmt(value):
+            return f"Level **{level_from_xp(value)[0]}** • {value:,} XP"
+    elif category == "trivia":
+        title = "🧠 Trivia Champions"
+        data = {uid: u["trivia_points"] for uid, u in users.items() if u["trivia_points"] > 0}
+
+        def fmt(value):
+            return f"**{value:,}** pts"
+    else:
+        title = "🏆 Giveaway Winners"
+        data = dict(win_counts.get(gid, {}))
+
+        def fmt(value):
+            return f"**{value}** win{'s' if value != 1 else ''}"
+
+    if not data:
+        await ctx.send("Nobody is on this leaderboard yet — chat, claim `/daily`, or start a `/trivia`!")
+        return
+
+    ranked = sorted(data.items(), key=lambda x: x[1], reverse=True)
     lines = []
-    for i, (uid, wins) in enumerate(sorted_wins):
-        prefix = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{prefix} <@{uid}> — **{wins}** win{'s' if wins != 1 else ''}")
+    for i, (uid, value) in enumerate(ranked[:10]):
+        prefix = MEDALS[i] if i < 3 else f"**{i + 1}.**"
+        lines.append(f"{prefix} <@{uid}> — {fmt(value)}")
+
+    embed = discord.Embed(title=title, description="\n".join(lines), color=get_guild_color(gid))
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    your_pos = next((i for i, (uid, _) in enumerate(ranked, start=1) if uid == ctx.author.id), None)
+    footer = f"Your rank: #{your_pos}" if your_pos else "You're not ranked yet"
+    embed.set_footer(text=f"{footer} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+# ----- balance / daily / work / rank -----
+
+@bot.hybrid_command(name="balance", description="Check how many coins you (or someone else) have")
+@app_commands.describe(member="Whose balance to check (default: you)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def balance_cmd(ctx, member: typing.Optional[discord.Member] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    target = member or ctx.author
+    if target.bot:
+        await ctx.send("Bots don't have wallets 🤖")
+        return
+
+    u = get_user(ctx.guild.id, target.id)
+    level = level_from_xp(u["xp"])[0]
+    position = rank_position(ctx.guild.id, target.id, "coins")
+
+    embed = discord.Embed(title=f"{COIN} {target.display_name}'s Balance", color=get_guild_color(ctx.guild.id))
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="Coins", value=f"**{u['coins']:,}** {COIN}", inline=True)
+    embed.add_field(name="Wealth rank", value=f"#{position}" if position else "Unranked", inline=True)
+    embed.add_field(name="Level", value=str(level), inline=True)
+
+    if target.id == ctx.author.id:
+        now = time.time()
+        if now - u["last_daily"] >= 86400:
+            daily_text = "✅ Ready — use **/daily**!"
+        else:
+            daily_text = f"Ready {fmt_ts(u['last_daily'] + 86400)}"
+        if u["streak"] > 1:
+            daily_text += f"\n🔥 {u['streak']}-day streak"
+        embed.add_field(name="Daily reward", value=daily_text, inline=False)
+
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="daily", description="Claim your free daily coins (once every 24 hours)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def daily_cmd(ctx):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    u = get_user(ctx.guild.id, ctx.author.id)
+    now = time.time()
+
+    if now - u["last_daily"] < 86400:
+        ready_at = u["last_daily"] + 86400
+        embed = discord.Embed(
+            description=f"⏳ You already claimed your daily reward! Come back {fmt_ts(ready_at)}.",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed, ephemeral=True)
+        return
+
+    # keep the streak alive if the last claim was within 48 hours
+    if u["last_daily"] and now - u["last_daily"] < 172800:
+        streak = u["streak"] + 1
+    else:
+        streak = 1
+
+    reward = DAILY_BASE + DAILY_STREAK_BONUS * min(streak - 1, 10)
+    u["coins"] += reward
+    u["last_daily"] = now
+    u["streak"] = streak
+    mark_dirty(ctx.guild.id, ctx.author.id)
 
     embed = discord.Embed(
-        title="🏆 Giveaway Leaderboard",
-        description="\n".join(lines),
-        color=get_guild_color(ctx.guild.id)
+        title="🎁 Daily Reward",
+        description=f"You claimed **{reward}** {COIN}!\n\n**Balance:** {u['coins']:,} {COIN}",
+        color=discord.Color.green()
     )
-    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
+    embed.add_field(name="Next reward", value=fmt_ts(now + 86400), inline=True)
+    embed.set_footer(text="Claim every day to build your streak • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+WORK_JOBS = [
+    ("You delivered pizzas around town", 40, 90),
+    ("You fixed a neighbour's Wi-Fi", 50, 110),
+    ("You walked a pack of very excited dogs", 30, 80),
+    ("You streamed to 3 viewers (one was your mum)", 20, 70),
+    ("You repaired a broken bicycle", 45, 100),
+    ("You sold homemade lemonade", 25, 75),
+    ("You mowed lawns all afternoon", 50, 110),
+    ("You debugged a bot at 3 AM", 60, 130),
+    ("You helped move a sofa up four flights of stairs", 55, 120),
+    ("You baked cookies for the school bake sale", 35, 85),
+]
+
+
+@bot.hybrid_command(name="work", description="Do a mini-job to earn some coins (once per hour)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def work_cmd(ctx):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    u = get_user(ctx.guild.id, ctx.author.id)
+    now = time.time()
+
+    if now - u["last_work"] < WORK_COOLDOWN:
+        ready_at = u["last_work"] + WORK_COOLDOWN
+        embed = discord.Embed(
+            description=f"😮‍💨 You're tired! You can work again {fmt_ts(ready_at)}.",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed, ephemeral=True)
+        return
+
+    text, low, high = random.choice(WORK_JOBS)
+    earned = random.randint(low, high)
+    u["coins"] += earned
+    u["last_work"] = now
+    mark_dirty(ctx.guild.id, ctx.author.id)
+
+    embed = discord.Embed(
+        title="💼 Work",
+        description=f"{text} and earned **{earned}** {COIN}!\n\n**Balance:** {u['coins']:,} {COIN}",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="You can work again in 1 hour • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="rank", description="Show your level card and XP progress")
+@app_commands.describe(member="Whose rank card to show (default: you)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def rank_cmd(ctx, member: typing.Optional[discord.Member] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    target = member or ctx.author
+    if target.bot:
+        await ctx.send("Bots don't earn XP 🤖")
+        return
+
+    u = get_user(ctx.guild.id, target.id)
+    level, into_level, needed = level_from_xp(u["xp"])
+    position = rank_position(ctx.guild.id, target.id, "xp")
+    bar = progress_bar(into_level, needed)
+    percent = int(100 * into_level / needed) if needed else 0
+
+    embed = discord.Embed(title=f"⭐ {target.display_name}'s Rank Card", color=get_guild_color(ctx.guild.id))
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.description = (
+        f"**Level {level}**\n"
+        f"{bar} **{percent}%**\n"
+        f"`{into_level:,} / {needed:,} XP` to level {level + 1}"
+    )
+    embed.add_field(name="Server rank", value=f"#{position}" if position else "Unranked", inline=True)
+    embed.add_field(name="Total XP", value=f"{u['xp']:,}", inline=True)
+    embed.add_field(name="Coins", value=f"{u['coins']:,} {COIN}", inline=True)
+    embed.set_footer(text="Chat to earn XP — one reward per minute • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+# ----- trivia -----
+
+TRIVIA_FALLBACK = [
+    ("What is the capital of Australia?", "Canberra", ["Sydney", "Melbourne", "Perth"]),
+    ("Which planet is known as the Red Planet?", "Mars", ["Venus", "Jupiter", "Mercury"]),
+    ("How many continents are there on Earth?", "7", ["5", "6", "8"]),
+    ("What is the largest ocean on Earth?", "Pacific Ocean", ["Atlantic Ocean", "Indian Ocean", "Arctic Ocean"]),
+    ("Who painted the Mona Lisa?", "Leonardo da Vinci", ["Michelangelo", "Raphael", "Vincent van Gogh"]),
+    ("What is the chemical symbol for gold?", "Au", ["Ag", "Gd", "Go"]),
+    ("In which country is the Great Pyramid of Giza?", "Egypt", ["Mexico", "Iraq", "Morocco"]),
+    ("How many sides does a hexagon have?", "6", ["5", "7", "8"]),
+    ("What is the largest mammal in the world?", "Blue whale", ["African elephant", "Giraffe", "Polar bear"]),
+    ("Which language has the most native speakers worldwide?", "Mandarin Chinese", ["English", "Spanish", "Hindi"]),
+    ("What is the hardest natural substance on Earth?", "Diamond", ["Quartz", "Titanium", "Granite"]),
+    ("Who wrote 'Romeo and Juliet'?", "William Shakespeare", ["Charles Dickens", "Jane Austen", "Mark Twain"]),
+    ("Which gas do plants absorb from the air for photosynthesis?", "Carbon dioxide", ["Oxygen", "Nitrogen", "Hydrogen"]),
+    ("What is the smallest prime number?", "2", ["0", "1", "3"]),
+    ("In which year did World War II end?", "1945", ["1939", "1943", "1950"]),
+    ("What is the currency of Japan?", "Yen", ["Won", "Yuan", "Ringgit"]),
+    ("Which organ pumps blood around the human body?", "Heart", ["Liver", "Lungs", "Kidneys"]),
+    ("What is the tallest mountain above sea level?", "Mount Everest", ["K2", "Kangchenjunga", "Kilimanjaro"]),
+    ("How many players does one football (soccer) team have on the pitch?", "11", ["9", "10", "12"]),
+    ("What is H2O more commonly known as?", "Water", ["Hydrogen peroxide", "Salt", "Ammonia"]),
+    ("Which country is home to the kangaroo?", "Australia", ["New Zealand", "South Africa", "Brazil"]),
+    ("What is the largest planet in our solar system?", "Jupiter", ["Saturn", "Neptune", "Earth"]),
+    ("Which festival is known as the Festival of Lights in India?", "Diwali", ["Holi", "Eid", "Pongal"]),
+    ("At sea level, water boils at what temperature?", "100°C", ["90°C", "110°C", "120°C"]),
+]
+
+
+async def fetch_trivia_questions(amount):
+    """Gets questions from Open Trivia DB; falls back to a built-in list if that's unavailable."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://opentdb.com/api.php", params={"amount": amount, "type": "multiple"}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("response_code") == 0 and data.get("results"):
+                        questions = []
+                        for item in data["results"]:
+                            questions.append({
+                                "question": html.unescape(item["question"]),
+                                "correct": html.unescape(item["correct_answer"]),
+                                "wrong": [html.unescape(x) for x in item["incorrect_answers"]],
+                                "category": html.unescape(item.get("category", "General Knowledge")),
+                            })
+                        return questions
+    except Exception as e:
+        print(f"Trivia API error (using built-in questions): {e}", flush=True)
+
+    picks = random.sample(TRIVIA_FALLBACK, min(amount, len(TRIVIA_FALLBACK)))
+    return [
+        {"question": q, "correct": correct, "wrong": list(wrong), "category": "General Knowledge"}
+        for q, correct, wrong in picks
+    ]
+
+
+class TriviaButton(discord.ui.Button):
+    def __init__(self, index):
+        super().__init__(label="ABCD"[index], style=discord.ButtonStyle.blurple)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if view.closed:
+            await interaction.response.send_message("⏰ Time's up for this question!", ephemeral=True)
+            return
+        if interaction.user.id in view.answers:
+            await interaction.response.send_message("You already locked in an answer for this question!", ephemeral=True)
+            return
+        view.answers[interaction.user.id] = (self.index, time.time())
+        await interaction.response.send_message(f"✅ You locked in **{self.label}**! Wait for the reveal...", ephemeral=True)
+
+
+class TriviaView(discord.ui.View):
+    def __init__(self, option_count):
+        super().__init__(timeout=None)
+        self.answers = {}   # user_id -> (chosen index, time clicked)
+        self.closed = False
+        for i in range(option_count):
+            self.add_item(TriviaButton(i))
+
+
+def scoreboard_text(scores, limit=5):
+    top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+    lines = []
+    for i, (uid, pts) in enumerate(top):
+        prefix = MEDALS[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} <@{uid}> — {pts} pts")
+    return "\n".join(lines)
+
+
+@bot.hybrid_command(name="trivia", description="Start a multiple-choice quiz — earn points and coins!")
+@app_commands.describe(rounds="How many questions to play (1-10, default 5)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
+    if not ctx.guild:
+        await ctx.send("Trivia only works in servers.")
+        return
+
+    if rounds is None:
+        rounds = 5
+    if rounds < 1 or rounds > 10:
+        await ctx.send("Pick between 1 and 10 questions.")
+        return
+
+    channel = ctx.channel
+    if channel.id in active_trivia:
+        await ctx.send("A trivia game is already running in this channel — wait for it to finish!")
+        return
+
+    active_trivia.add(channel.id)
+    scores = {}
+    try:
+        await ctx.defer()
+        questions = await fetch_trivia_questions(rounds)
+        total = len(questions)
+
+        intro = discord.Embed(
+            title="🧠 Trivia time!",
+            description=(
+                f"**{total}** question{'s' if total != 1 else ''}, **{TRIVIA_SECONDS} seconds** each.\n"
+                f"Click a button to lock in your answer (you only get one try).\n\n"
+                f"✅ Correct answer = **10 points**\n"
+                f"⚡ Fastest correct answers get a bonus: +{TRIVIA_BONUS[0]}, +{TRIVIA_BONUS[1]}, +{TRIVIA_BONUS[2]}\n"
+                f"{COIN} Every point is also added to your coins!"
+            ),
+            color=DEFAULT_COLOR
+        )
+        intro.set_footer(text=f"Started by {ctx.author.display_name} • ChillBot 😎")
+        await ctx.send(embed=intro)
+        await asyncio.sleep(4)
+
+        for n, q in enumerate(questions, start=1):
+            options = q["wrong"] + [q["correct"]]
+            random.shuffle(options)
+            correct_index = options.index(q["correct"])
+            letters = "ABCD"
+
+            option_lines = "\n".join(f"**{letters[i]})** {opt}" for i, opt in enumerate(options))
+            question_embed = discord.Embed(
+                title=f"🧠 Trivia — Question {n}/{total}",
+                description=f"**{q['question']}**\n\n{option_lines}",
+                color=DEFAULT_COLOR
+            )
+            question_embed.add_field(name="Category", value=q["category"], inline=True)
+            question_embed.add_field(name="Time's up", value=fmt_ts(time.time() + TRIVIA_SECONDS), inline=True)
+            question_embed.set_footer(text="Click a button to answer • ChillBot 😎")
+
+            view = TriviaView(len(options))
+            msg = await channel.send(embed=question_embed, view=view)
+            await asyncio.sleep(TRIVIA_SECONDS)
+
+            # ----- reveal -----
+            view.closed = True
+            for child in view.children:
+                child.disabled = True
+
+            correct_users = sorted(
+                (clicked_at, uid) for uid, (idx, clicked_at) in view.answers.items() if idx == correct_index
+            )
+            winner_lines = []
+            for place, (_, uid) in enumerate(correct_users):
+                pts = 10 + (TRIVIA_BONUS[place] if place < len(TRIVIA_BONUS) else 0)
+                scores[uid] = scores.get(uid, 0) + pts
+
+                # points are saved (and turned into coins) right away
+                player = get_user(ctx.guild.id, uid)
+                player["trivia_points"] += pts
+                player["coins"] += pts
+                mark_dirty(ctx.guild.id, uid)
+
+                if place < 8:
+                    winner_lines.append(f"<@{uid}> +{pts}")
+
+            reveal_options = "\n".join(
+                f"{'✅ ' if i == correct_index else ''}**{letters[i]})** {opt}" for i, opt in enumerate(options)
+            )
+            reveal = discord.Embed(
+                title=f"🧠 Trivia — Question {n}/{total}",
+                description=f"**{q['question']}**\n\n{reveal_options}",
+                color=discord.Color.green() if correct_users else discord.Color.red()
+            )
+            reveal.add_field(
+                name="Got it right",
+                value="\n".join(winner_lines) if winner_lines else "Nobody 😅",
+                inline=True
+            )
+            if scores:
+                reveal.add_field(name="Scoreboard", value=scoreboard_text(scores), inline=True)
+            reveal.set_footer(text=f"{len(view.answers)} player(s) answered • ChillBot 😎")
+            try:
+                await msg.edit(embed=reveal, view=view)
+            except Exception as e:
+                print(f"Trivia reveal edit failed: {e}", flush=True)
+
+            if n < total:
+                await asyncio.sleep(4)
+
+        # ----- final results -----
+        if scores:
+            description = "**Final standings:**\n" + scoreboard_text(scores, limit=10)
+        else:
+            description = "Nobody scored this time — better luck next game! 🍀"
+        final = discord.Embed(title="🏁 Trivia finished!", description=description, color=discord.Color.gold())
+        final.set_footer(text="Points were added to your coins and /leaderboard trivia • ChillBot 😎")
+        await channel.send(embed=final)
+
+    except Exception as e:
+        print(f"Trivia error: {e}", flush=True)
+        try:
+            await channel.send("Something went wrong with the trivia game, sorry! Try again in a moment.")
+        except Exception:
+            pass
+    finally:
+        active_trivia.discard(channel.id)
+
+
+# ----- jail -----
+
+def can_jail(member: discord.Member):
+    return is_admin_or_owner(member) or member.guild_permissions.moderate_members
+
+
+def schedule_jail_release(guild_id, user_id, until_ts):
+    key = (guild_id, user_id)
+    old = jail_tasks.pop(key, None)
+    if old:
+        old.cancel()
+
+    async def _runner():
+        delay = until_ts - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        await release_jail(guild_id, user_id)
+
+    jail_tasks[key] = asyncio.create_task(_runner())
+
+
+async def release_jail(guild_id, user_id, released_by=None):
+    key = (guild_id, user_id)
+    task = jail_tasks.pop(key, None)
+    if task and task is not asyncio.current_task():
+        task.cancel()
+
+    u = get_user(guild_id, user_id)
+    role_id = u.get("jail_role_id") or jail_roles.get(guild_id)
+    u["jailed_until"] = None
+    u["jail_role_id"] = None
+    mark_dirty(guild_id, user_id)
+
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+
+    member = guild.get_member(user_id)
+    role = guild.get_role(role_id) if role_id else None
+    if member and role and role in member.roles:
+        try:
+            await member.remove_roles(role, reason="Jail time is over" if not released_by else f"Released by {released_by}")
+        except Exception as e:
+            print(f"Failed to remove jailed role: {e}", flush=True)
+
+    if released_by:
+        text = f"<@{user_id}> was let out of jail early by {released_by.mention}."
+    else:
+        text = f"<@{user_id}> served their time and was released from jail."
+    log_embed = discord.Embed(title="🔓 Released from jail", description=text, color=discord.Color.green())
+    await send_log(guild, log_embed)
+
+
+async def economy_on_member_join(member):
+    """If someone leaves the server to dodge jail, they get the jailed role back when they rejoin."""
+    try:
+        u = economy.get(member.guild.id, {}).get(member.id)
+        if not u or not u.get("jailed_until"):
+            return
+        if u["jailed_until"] <= time.time():
+            await release_jail(member.guild.id, member.id)
+            return
+        role_id = u.get("jail_role_id") or jail_roles.get(member.guild.id)
+        role = member.guild.get_role(role_id) if role_id else None
+        if role:
+            await member.add_roles(role, reason="Still serving jail time")
+    except Exception as e:
+        print(f"economy_on_member_join error: {e}", flush=True)
+
+
+@bot.hybrid_command(name="jail", description="Send a member to jail (gives them the jailed role for a set time)")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    member="Who to jail",
+    duration="How long, e.g. 10m, 2h, 1d, 1h30m",
+    reason="Optional reason"
+)
+async def jail_cmd(ctx, member: discord.Member, duration: str, reason: typing.Optional[str] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    if not can_jail(ctx.author):
+        await ctx.send("You need the **Moderate Members** permission (or be an admin) to jail people.", ephemeral=True)
+        return
+
+    role_id = jail_roles.get(ctx.guild.id)
+    role = ctx.guild.get_role(role_id) if role_id else None
+    if role is None:
+        await ctx.send(
+            "There's no jailed role set up yet. An admin can pick one with **/setup** → *Set the jailed role*.",
+            ephemeral=True
+        )
+        return
+
+    if member.bot:
+        await ctx.send("You can't jail a bot 🤖", ephemeral=True)
+        return
+    if member.id == ctx.author.id:
+        await ctx.send("You can't jail yourself!", ephemeral=True)
+        return
+    if member.id == ctx.guild.owner_id or member.guild_permissions.administrator:
+        await ctx.send("You can't jail the server owner or an administrator.", ephemeral=True)
+        return
+    if ctx.author.id != ctx.guild.owner_id and member.top_role >= ctx.author.top_role:
+        await ctx.send("You can only jail members whose highest role is below yours.", ephemeral=True)
+        return
+
+    seconds = parse_duration(duration)
+    if seconds is None:
+        await ctx.send("Invalid duration. Use formats like `10m`, `2h`, `1d`, or `1h30m`.", ephemeral=True)
+        return
+    if seconds < 10:
+        await ctx.send("Jail time must be at least 10 seconds.", ephemeral=True)
+        return
+    if seconds > JAIL_MAX_SECONDS:
+        await ctx.send("Jail time can't be longer than 30 days.", ephemeral=True)
+        return
+
+    if reason and len(reason) > 200:
+        await ctx.send("Reason is too long (max 200 characters).", ephemeral=True)
+        return
+
+    if role.managed or role >= ctx.guild.me.top_role:
+        await ctx.send(
+            "I can't hand out the jailed role — in Server Settings → Roles, drag my role above it "
+            "and make sure I have **Manage Roles**.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await member.add_roles(role, reason=f"Jailed by {ctx.author} ({ctx.author.id}): {reason or 'no reason given'}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to give that role. Check that I have **Manage Roles**.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Jail add_roles error: {e}", flush=True)
+        await ctx.send("Something went wrong giving the jailed role, try again.", ephemeral=True)
+        return
+
+    until_ts = time.time() + seconds
+    u = get_user(ctx.guild.id, member.id)
+    u["jailed_until"] = until_ts
+    u["jail_role_id"] = role.id
+    mark_dirty(ctx.guild.id, member.id)
+    schedule_jail_release(ctx.guild.id, member.id, until_ts)
+
+    embed = discord.Embed(
+        title="🚔 Sent to jail",
+        description=f"{member.mention} has been jailed by {ctx.author.mention}.",
+        color=discord.Color.red()
+    )
+    embed.add_field(name="Released", value=fmt_ts(until_ts), inline=True)
+    embed.add_field(name="Reason", value=reason or "No reason given", inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(
+        title="🚔 Member Jailed",
+        description=f"{member.mention} was jailed by {ctx.author.mention} until {fmt_ts(until_ts, 'f')}",
+        color=discord.Color.red()
+    )
+    log_embed.add_field(name="Reason", value=reason or "No reason given", inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="unjail", description="Let a member out of jail early")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to release")
+async def unjail_cmd(ctx, member: discord.Member):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    if not can_jail(ctx.author):
+        await ctx.send("You need the **Moderate Members** permission (or be an admin) to release people.", ephemeral=True)
+        return
+
+    u = economy.get(ctx.guild.id, {}).get(member.id)
+    if not u or not u.get("jailed_until"):
+        await ctx.send(f"{member.mention} isn't in jail.", ephemeral=True)
+        return
+
+    await release_jail(ctx.guild.id, member.id, released_by=ctx.author)
+    embed = discord.Embed(
+        title="🔓 Released",
+        description=f"{member.mention} was let out of jail by {ctx.author.mention}.",
+        color=discord.Color.green()
+    )
     await ctx.send(embed=embed)
 
 
@@ -1929,5 +2779,9 @@ async def on_message(message):
     except Exception as e:
         print(f"on_message error: {e}", flush=True)
 
+
+# XP / levels and the "jailed people get their role back if they rejoin" check run alongside the handlers above
+bot.add_listener(economy_on_message, "on_message")
+bot.add_listener(economy_on_member_join, "on_member_join")
 
 bot.run(os.environ["DISCORD_TOKEN"])
