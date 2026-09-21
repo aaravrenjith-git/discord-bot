@@ -979,6 +979,8 @@ async def eight_ball(ctx, *, question: str):
 
 @bot.hybrid_command(name="roll", description="Roll dice, e.g. 2d20")
 @app_commands.describe(dice="Format: [count]d[sides], e.g. 2d20 or 1d6")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def roll(ctx, dice: str = "1d6"):
     match = re.match(r"^(\d+)d(\d+)$", dice.strip().lower())
     if not match:
@@ -1011,6 +1013,8 @@ async def roll(ctx, dice: str = "1d6"):
 
 
 @bot.hybrid_command(name="meme", description="Get a random meme")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def meme(ctx):
     await ctx.defer()
     try:
@@ -1040,6 +1044,8 @@ async def meme(ctx):
 
 
 @bot.hybrid_command(name="coinflip", description="Flip a coin")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def coinflip(ctx):
     result = random.choice(["Heads", "Tails"])
     emoji = "🪙"
@@ -1138,6 +1144,8 @@ class RPSView(discord.ui.View):
 
 @bot.hybrid_command(name="game", description="Play rock-paper-scissors against ChillBot or challenge a friend")
 @app_commands.describe(opponent="Optional: challenge this member instead of playing against ChillBot")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def game(ctx, opponent: typing.Optional[discord.Member] = None):
     if opponent and opponent.bot:
         await ctx.send("You can't challenge a bot to this game.")
@@ -1162,6 +1170,8 @@ async def game(ctx, opponent: typing.Optional[discord.Member] = None):
 
 
 @bot.hybrid_command(name="ping", description="Check ChillBot's latency")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def ping(ctx):
     latency = round(bot.latency * 1000)
     embed = discord.Embed(
