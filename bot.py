@@ -358,6 +358,44 @@ class ParticipantsView(discord.ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
+class ConfirmLeaveView(discord.ui.View):
+    def __init__(self, giveaway_id, user_id):
+        super().__init__(timeout=30)
+        self.giveaway_id = giveaway_id
+        self.user_id = user_id
+
+    @discord.ui.button(label="Confirm Leave", style=discord.ButtonStyle.danger, emoji="🚪")
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+            return
+
+        gw = giveaways.get(self.giveaway_id)
+        if not gw:
+            await interaction.response.edit_message(content="This giveaway no longer exists.", embed=None, view=None)
+            return
+
+        gw["joined_users"].discard(self.user_id)
+        gw["entries"] = [uid for uid in gw["entries"] if uid != self.user_id]
+        save_giveaway(self.giveaway_id)
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="You left the giveaway and your entries have been reset. 👋", view=self
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your confirmation.", ephemeral=True)
+            return
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="Staying in the giveaway. 🎉", view=self)
+
+
 class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id):
         super().__init__(timeout=None)
@@ -375,9 +413,13 @@ class GiveawayView(discord.ui.View):
             bypass = has_bypass(user, gw["bypass_role_id"])
 
             if user.id in gw["joined_users"]:
-                gw["joined_users"].discard(user.id)
-                save_giveaway(self.giveaway_id)
-                await interaction.response.send_message("You left the giveaway. 👋", ephemeral=True)
+                confirm_view = ConfirmLeaveView(self.giveaway_id, user.id)
+                current_entries = gw["entries"].count(user.id)
+                await interaction.response.send_message(
+                    f"⚠️ Are you sure you want to leave? You currently have **{current_entries}** entr{'y' if current_entries == 1 else 'ies'} — leaving will **reset them to 0**.",
+                    view=confirm_view,
+                    ephemeral=True
+                )
                 return
 
             if not bypass:
