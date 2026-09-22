@@ -35,12 +35,33 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+# Prefix commands are disabled — ChillBot only responds to slash commands now
+# (and to @mentions, which are handled separately in on_message). If you ever
+# want a text prefix back, swap this for command_prefix="!" or similar.
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 OWNER_ID = 1160627021865549976
 OWNER_NAME = "Aarav"
 DEFAULT_COLOR = discord.Color.from_str("#5865F2")
 BOT_START_TIME = datetime.datetime.now(datetime.timezone.utc)
+
+# ---------- ANIMATED EMOJIS ----------
+# Discord animated emojis only work if the ID belongs to an emoji actually
+# uploaded to a server ChillBot can see — an ID copied from a random website
+# will just render as broken text, so these can't be filled in for you sight
+# unseen. To get real ones:
+#   1. Grab free animated (.gif) emoji packs from sites like emoji.gg,
+#      discadia.com/emojis, or phisheye.gg — filter by "animated".
+#   2. Upload the .gif to any server ChillBot is a member of
+#      (Server Settings → Emoji → Upload Emoji).
+#   3. In any Discord chat, type \:youremojiname: and hit send — Discord
+#      replaces it with the raw code, e.g. <a:party:1234567890123456789>.
+#   4. Copy that whole string into the placeholders below.
+EMOJI_PARTY = "<a:party:REPLACE_WITH_YOUR_EMOJI_ID>"
+EMOJI_COINS = "<a:coins:REPLACE_WITH_YOUR_EMOJI_ID>"
+EMOJI_FIRE = "<a:fire:REPLACE_WITH_YOUR_EMOJI_ID>"
+EMOJI_DICE = "<a:dice:REPLACE_WITH_YOUR_EMOJI_ID>"
+EMOJI_JAIL = "<a:jail:REPLACE_WITH_YOUR_EMOJI_ID>"
 
 OWNER_REPLIES = [
     "Yes, master? 👑",
@@ -1042,7 +1063,7 @@ async def end_giveaway(giveaway_id):
 
     embed = discord.Embed(
         title="🎉 Giveaway Ended!",
-        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! 🎊",
+        description=f"**Prize:** {gw['prize']}\n\n**Winner(s):**\n{winners_text}\n\nCongratulations! 🎊 {EMOJI_PARTY}",
         color=discord.Color.green()
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
@@ -1614,7 +1635,7 @@ async def daily_cmd(ctx):
         description=f"You claimed **{reward}** {COIN}{boost_note}!\n\n**Balance:** {u['coins']:,} {COIN}",
         color=discord.Color.green()
     )
-    embed.add_field(name="Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
+    embed.add_field(name="Streak", value=f"{EMOJI_FIRE} {streak} day{'s' if streak != 1 else ''}", inline=True)
     embed.add_field(name="Next reward", value=fmt_ts(now + 86400), inline=True)
     embed.set_footer(text="Claim every day to build your streak • ChillBot 😎")
     await ctx.send(embed=embed)
@@ -1729,7 +1750,7 @@ async def shop_cmd(ctx):
 
     u = get_user(ctx.guild.id, ctx.author.id)
     embed = discord.Embed(
-        title="🛒 ChillBot Shop",
+        title=f"🛒 ChillBot Shop {EMOJI_COINS}",
         description=f"You have **{u['coins']:,}** {COIN}\n\nPick a boost to buy below:",
         color=get_guild_color(ctx.guild.id)
     )
@@ -1976,7 +1997,7 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
             description = "**Final standings:**\n" + scoreboard_text(scores, limit=10)
         else:
             description = "Nobody scored this time — better luck next game! 🍀"
-        final = discord.Embed(title="🏁 Trivia finished!", description=description, color=discord.Color.gold())
+        final = discord.Embed(title=f"🏁 Trivia finished! {EMOJI_PARTY}", description=description, color=discord.Color.gold())
         final.set_footer(text="Points were added to your coins and /leaderboard trivia • ChillBot 😎")
         await channel.send(embed=final)
 
@@ -2141,7 +2162,7 @@ async def jail_cmd(ctx, member: discord.Member, duration: str, reason: typing.Op
     schedule_jail_release(ctx.guild.id, member.id, until_ts)
 
     embed = discord.Embed(
-        title="🚔 Sent to jail",
+        title=f"🚔 Sent to jail {EMOJI_JAIL}",
         description=f"{member.mention} has been jailed by {ctx.author.mention}.",
         color=discord.Color.red()
     )
@@ -2248,7 +2269,7 @@ async def roll(ctx, dice: str = "1d6"):
     total = sum(rolls)
 
     embed = discord.Embed(
-        title="🎲 Dice Roll",
+        title=f"🎲 Dice Roll {EMOJI_DICE}",
         description=f"Rolling **{dice}**...",
         color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
@@ -2957,8 +2978,6 @@ async def on_message(message):
                 if message.author.id not in gw["joined_users"]:
                     continue
                 if not channel_counts(message.guild.id, message.channel.id, gw["channel_id"]):
-                    continue
-                if message.content.startswith("?"):
                     continue
 
                 mult = get_multiplier(message.guild.id, message.author)
