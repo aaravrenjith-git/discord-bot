@@ -72,13 +72,12 @@ default_ping_roles = {}
 embed_colors = {}
 jail_roles = {}
 
-# economy / levels: economy[guild_id][user_id] = {...}, saved to MongoDB in batches
+# economy: economy[guild_id][user_id] = {...}, saved to MongoDB in batches
 economy = {}
 economy_dirty = set()
 economy_loaded = False
 economy_tasks_started = False
 jail_tasks = {}
-xp_cooldowns = {}
 active_trivia = set()
 
 
@@ -534,7 +533,7 @@ async def help_cmd(ctx):
     embed.add_field(
         name="🎉 Giveaway Commands (Admins or authorized roles)",
         value=(
-            "**/start-giveaway** — Create a new giveaway with a join button\n"
+            "**/start-giveaway** — Create a new giveaway (with a confirm step first)\n"
             "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
             "**/cancel-giveaway** — Cancel a running giveaway without picking a winner\n"
             "**/edit-giveaway** — Fix a mistake in a running giveaway\n"
@@ -543,18 +542,14 @@ async def help_cmd(ctx):
         inline=False
     )
     embed.add_field(
-        name="🏆 Everyone",
-        value="**/leaderboard** — See the top members: richest, highest level, trivia champs, or giveaway winners",
-        inline=False
-    )
-    embed.add_field(
-        name="💰 Economy & Levels",
+        name="💰 Economy & Shop",
         value=(
             "**/balance** — Check how many coins you (or someone else) have\n"
             "**/daily** — Claim a free reward every 24 hours (streaks pay more!)\n"
             "**/work** — Do a mini-job to earn extra coins\n"
-            "**/rank** — See your level card and XP progress bar\n"
-            "**/trivia** — Start a multiple-choice quiz for points and coins"
+            "**/shop** — Spend coins on boosts and power-ups\n"
+            "**/trivia** — Multiple-choice quiz for coins\n"
+            "**/leaderboard** — Server or global rankings"
         ),
         inline=False
     )
@@ -575,13 +570,16 @@ async def help_cmd(ctx):
         inline=False
     )
     embed.add_field(
-        name="🎮 Fun",
+        name="🎮 Fun & Games",
         value=(
             "**/8ball** — Ask the magic 8-ball a question\n"
             "**/roll** — Roll dice, e.g. 2d20\n"
             "**/meme** — Get a random meme\n"
             "**/coinflip** — Flip a coin\n"
             "**/game** — Play rock-paper-scissors vs ChillBot or a friend\n"
+            "**/higher-lower** — Guess if the next card is higher or lower\n"
+            "**/minesweeper** — Click cells, don't hit a bomb!\n"
+            "**/connect4** — Challenge a friend to Connect 4\n"
             "**/ping** — Check ChillBot's latency"
         ),
         inline=False
@@ -590,10 +588,7 @@ async def help_cmd(ctx):
         name="🌍 Anywhere (DMs, group chats, or servers)",
         value=(
             "**/translate** — Translate text into another language\n"
-            "**/wordle** — Guess the 5-letter word in 6 tries\n"
-            "**/minesweeper** — Generate a spoiler-tag minesweeper grid\n"
-            "**/higher-lower** — Guess if the next card is higher or lower\n"
-            "**/connect4** — Challenge a friend to Connect 4"
+            "**/wordle** — Guess the 5-letter word in 6 tries"
         ),
         inline=False
     )
@@ -795,7 +790,138 @@ async def setup_cmd(
 
 # ---------- GIVEAWAY COMMANDS ----------
 
-@bot.hybrid_command(name="start-giveaway", description="Create a new giveaway with a join button")
+def build_giveaway_embed(ctx, prize, winners, timestamp, required_role, blacklist_role, bypass_role, image_url, guild_color, preview=False):
+    title = "🔎 GIVEAWAY PREVIEW" if preview else "🎉  G I V E A W A Y  🎉"
+    desc_intro = "This is what your giveaway will look like. Confirm to post it!\n\n" if preview else ""
+    embed = discord.Embed(
+        title=title,
+        description=(
+            f"{desc_intro}✨ **{prize}** ✨\n\n"
+            "Click **🎉 Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n"
+            "*Click Join again anytime to leave.*"
+        ),
+        color=guild_color
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="🎤 Hosted by", value=ctx.author.mention, inline=True)
+    embed.add_field(name="⏰ Ends", value=timestamp, inline=True)
+    embed.add_field(name="🏆 Winners", value=str(winners), inline=True)
+    if required_role:
+        embed.add_field(name="🔑 Required role", value=required_role.mention, inline=True)
+    if blacklist_role:
+        embed.add_field(name="🚫 Blacklisted role", value=blacklist_role.mention, inline=True)
+    if bypass_role:
+        embed.add_field(name="⚡ Bypass role", value=bypass_role.mention, inline=True)
+
+    guild_mults = multiplier_roles.get(ctx.guild.id, {})
+    if guild_mults:
+        mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
+        embed.add_field(name="⭐ Bonus entry roles", value=mults_text, inline=False)
+
+    if image_url:
+        embed.set_image(url=image_url)
+
+    return embed
+
+
+async def publish_giveaway(ctx, duration, prize, winners, required_role, blacklist_role, bypass_role, image_url, ping_role, end_time):
+    guild_color = get_guild_color(ctx.guild.id)
+    timestamp = discord.utils.format_dt(end_time, style="R")
+
+    # a fresh embed is built here, separate from the preview shown during confirmation
+    embed = build_giveaway_embed(ctx, prize, winners, timestamp, required_role, blacklist_role, bypass_role, image_url, guild_color)
+    embed.set_footer(text="Starting... • ChillBot 😎", icon_url=bot.user.display_avatar.url)
+
+    final_ping_role = ping_role or (ctx.guild.get_role(default_ping_roles[ctx.guild.id]) if ctx.guild.id in default_ping_roles else None)
+    content = final_ping_role.mention if final_ping_role else None
+
+    msg = await ctx.channel.send(content=content, embed=embed)
+    view = GiveawayView(msg.id)
+
+    giveaways[msg.id] = {
+        "channel_id": ctx.channel.id,
+        "guild_id": ctx.guild.id,
+        "host_id": ctx.author.id,
+        "prize": prize,
+        "winners": winners,
+        "required_role_id": required_role.id if required_role else None,
+        "blacklist_role_id": blacklist_role.id if blacklist_role else None,
+        "bypass_role_id": bypass_role.id if bypass_role else None,
+        "joined_users": set(),
+        "entries": [],
+        "active": True,
+        "end_time": end_time,
+    }
+    save_giveaway(msg.id)
+
+    embed.set_footer(text=f"Giveaway ID: {msg.id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
+    await msg.edit(embed=embed, view=view)
+
+    log_embed = discord.Embed(
+        title="🎉 Giveaway Started",
+        description=f"**Prize:** {prize}\n**Duration:** {duration}\n**Winners:** {winners}",
+        color=guild_color
+    )
+    log_embed.add_field(name="Hosted by", value=ctx.author.mention, inline=True)
+    log_embed.add_field(name="Channel", value=ctx.channel.mention, inline=True)
+    log_embed.set_footer(text=f"Giveaway ID: {msg.id}")
+    await send_log(ctx.guild, log_embed)
+
+    await discord.utils.sleep_until(end_time)
+    if giveaways.get(msg.id, {}).get("active"):
+        await end_giveaway(msg.id)
+
+
+class StartGiveawayConfirmView(discord.ui.View):
+    def __init__(self, ctx, duration, prize, winners, required_role, blacklist_role, bypass_role, image_url, ping_role, end_time):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+        self.duration = duration
+        self.prize = prize
+        self.winners = winners
+        self.required_role = required_role
+        self.blacklist_role = blacklist_role
+        self.bypass_role = bypass_role
+        self.image_url = image_url
+        self.ping_role = ping_role
+        self.end_time = end_time
+        self.done = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Only the person who ran this command can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="✅ Confirm & Start", style=discord.ButtonStyle.success)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="✅ Giveaway posted below!", embed=None, view=self)
+        await publish_giveaway(
+            self.ctx, self.duration, self.prize, self.winners, self.required_role,
+            self.blacklist_role, self.bypass_role, self.image_url, self.ping_role, self.end_time
+        )
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.done = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="❌ Giveaway cancelled — nothing was posted.", embed=None, view=self)
+
+    async def on_timeout(self):
+        if not self.done:
+            for child in self.children:
+                child.disabled = True
+            try:
+                await self.ctx.edit(content="⌛ Confirmation timed out — nothing was posted.", embed=None, view=self)
+            except Exception:
+                pass
+
+
+@bot.hybrid_command(name="start-giveaway", description="Create a new giveaway (shows a preview to confirm first)")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -850,70 +976,16 @@ async def start_giveaway(
     timestamp = discord.utils.format_dt(end_time, style="R")
     guild_color = get_guild_color(ctx.guild.id)
 
-    embed = discord.Embed(
-        title="🎉  G I V E A W A Y  🎉",
-        description=f"✨ **{prize}** ✨\n\nClick **🎉 Join Giveaway** below to enter, then chat in the allowed channel(s) — every message earns an entry!\n*Click Join again anytime to leave.*",
-        color=guild_color
+    preview_embed = build_giveaway_embed(
+        ctx, prize, winners, timestamp, required_role, blacklist_role, bypass_role, image_url, guild_color, preview=True
     )
-    embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(name="🎤 Hosted by", value=ctx.author.mention, inline=True)
-    embed.add_field(name="⏰ Ends", value=timestamp, inline=True)
-    embed.add_field(name="🏆 Winners", value=str(winners), inline=True)
-    if required_role:
-        embed.add_field(name="🔑 Required role", value=required_role.mention, inline=True)
-    if blacklist_role:
-        embed.add_field(name="🚫 Blacklisted role", value=blacklist_role.mention, inline=True)
-    if bypass_role:
-        embed.add_field(name="⚡ Bypass role", value=bypass_role.mention, inline=True)
-
-    guild_mults = multiplier_roles.get(ctx.guild.id, {})
-    if guild_mults:
-        mults_text = "\n".join(f"<@&{rid}> — **{mult}x** entries" for rid, mult in guild_mults.items())
-        embed.add_field(name="⭐ Bonus entry roles", value=mults_text, inline=False)
-
-    if image_url:
-        embed.set_image(url=image_url)
-
-    embed.set_footer(text="Starting... • ChillBot 😎", icon_url=bot.user.display_avatar.url)
-
-    final_ping_role = ping_role or (ctx.guild.get_role(default_ping_roles[ctx.guild.id]) if ctx.guild.id in default_ping_roles else None)
-    content = final_ping_role.mention if final_ping_role else None
-
-    msg = await ctx.send(content=content, embed=embed)
-    view = GiveawayView(msg.id)
-
-    giveaways[msg.id] = {
-        "channel_id": ctx.channel.id,
-        "guild_id": ctx.guild.id,
-        "host_id": ctx.author.id,
-        "prize": prize,
-        "winners": winners,
-        "required_role_id": required_role.id if required_role else None,
-        "blacklist_role_id": blacklist_role.id if blacklist_role else None,
-        "bypass_role_id": bypass_role.id if bypass_role else None,
-        "joined_users": set(),
-        "entries": [],
-        "active": True,
-        "end_time": end_time,
-    }
-    save_giveaway(msg.id)
-
-    embed.set_footer(text=f"Giveaway ID: {msg.id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
-    await msg.edit(embed=embed, view=view)
-
-    log_embed = discord.Embed(
-        title="🎉 Giveaway Started",
-        description=f"**Prize:** {prize}\n**Duration:** {duration}\n**Winners:** {winners}",
-        color=guild_color
+    view = StartGiveawayConfirmView(
+        ctx, duration, prize, winners, required_role, blacklist_role, bypass_role, image_url, ping_role, end_time
     )
-    log_embed.add_field(name="Hosted by", value=ctx.author.mention, inline=True)
-    log_embed.add_field(name="Channel", value=ctx.channel.mention, inline=True)
-    log_embed.set_footer(text=f"Giveaway ID: {msg.id}")
-    await send_log(ctx.guild, log_embed)
-
-    await discord.utils.sleep_until(end_time)
-    if giveaways.get(msg.id, {}).get("active"):
-        await end_giveaway(msg.id)
+    await ctx.send(
+        content="Review your giveaway below, then confirm to post it publicly.",
+        embed=preview_embed, view=view, ephemeral=True
+    )
 
 
 async def end_giveaway(giveaway_id):
@@ -1256,11 +1328,10 @@ async def embed_cmd(
         await ctx.send("I don't have permission to send messages in that channel.")
 
 
-# ---------- ECONOMY, LEVELS, TRIVIA & JAIL ----------
+# ---------- ECONOMY, SHOP, TRIVIA & JAIL ----------
 
 COIN = "🪙"
 MEDALS = ["🥇", "🥈", "🥉"]
-XP_COOLDOWN = 60            # seconds between messages that give XP
 DAILY_BASE = 100
 DAILY_STREAK_BONUS = 25     # extra coins per streak day (up to 10 extra days)
 WORK_COOLDOWN = 3600        # 1 hour
@@ -1270,14 +1341,25 @@ JAIL_MAX_SECONDS = 30 * 86400
 
 DEFAULT_USER = {
     "coins": 0,
-    "xp": 0,
     "last_daily": 0.0,
     "streak": 0,
     "last_work": 0.0,
     "trivia_points": 0,
     "jailed_until": None,
     "jail_role_id": None,
+    "boost_multiplier": 1,
+    "boost_until": 0.0,
+    "boost_name": None,
 }
+
+SHOP_ITEMS = [
+    {"id": "boost2x_1h", "name": "🚀 2x Coin Boost — 1 hour", "price": 250, "multiplier": 2, "hours": 1,
+     "desc": "Doubles coins from /daily, /work and /trivia for 1 hour."},
+    {"id": "boost2x_6h", "name": "🚀 2x Coin Boost — 6 hours", "price": 1200, "multiplier": 2, "hours": 6,
+     "desc": "Doubles coins from /daily, /work and /trivia for 6 hours."},
+    {"id": "boost3x_24h", "name": "🔥 3x Coin Boost — 24 hours", "price": 4000, "multiplier": 3, "hours": 24,
+     "desc": "Triples coins from /daily, /work and /trivia for a full day."},
+]
 
 
 def get_user(guild_id, user_id):
@@ -1293,24 +1375,10 @@ def mark_dirty(guild_id, user_id):
     economy_dirty.add((guild_id, user_id))
 
 
-def xp_for_next(level):
-    """XP needed to go from `level` to `level + 1`."""
-    return 5 * level * level + 50 * level + 100
-
-
-def level_from_xp(xp):
-    """Returns (level, xp earned inside this level, xp needed for the next level)."""
-    level = 0
-    while xp >= xp_for_next(level):
-        xp -= xp_for_next(level)
-        level += 1
-    return level, xp, xp_for_next(level)
-
-
-def progress_bar(current, needed, length=12):
-    filled = int(length * current / needed) if needed else 0
-    filled = max(0, min(length, filled))
-    return "▰" * filled + "▱" * (length - filled)
+def active_multiplier(u):
+    if u.get("boost_until", 0) > time.time():
+        return u.get("boost_multiplier", 1)
+    return 1
 
 
 def rank_position(guild_id, user_id, key):
@@ -1324,6 +1392,16 @@ def rank_position(guild_id, user_id, key):
         if uid == user_id:
             return i
     return None
+
+
+def aggregate_global(key):
+    totals = {}
+    for users in economy.values():
+        for uid, u in users.items():
+            val = u.get(key, 0)
+            if val > 0:
+                totals[uid] = totals.get(uid, 0) + val
+    return totals
 
 
 def fmt_ts(ts, style="R"):
@@ -1341,7 +1419,6 @@ def flush_economy_sync(batch):
 async def economy_flush_loop():
     while True:
         await asyncio.sleep(15)
-        # never write before the saved data has been loaded, or we could overwrite it with blanks
         if not economy_loaded or not economy_dirty:
             continue
         keys = list(economy_dirty)
@@ -1392,77 +1469,52 @@ async def apply_user_data(user_docs):
     print(f"Loaded economy data for {len(user_docs)} member(s) from database.", flush=True)
 
 
-# ----- XP from chatting -----
+# ----- leaderboard (server + global) -----
 
-async def economy_on_message(message):
-    try:
-        if message.author.bot or not message.guild:
-            return
-        if message.content.startswith("?"):
-            return
-
-        key = (message.guild.id, message.author.id)
-        now = time.time()
-        if now - xp_cooldowns.get(key, 0) < XP_COOLDOWN:
-            return
-        xp_cooldowns[key] = now
-
-        u = get_user(*key)
-        old_level = level_from_xp(u["xp"])[0]
-        u["xp"] += random.randint(15, 25)
-        new_level = level_from_xp(u["xp"])[0]
-
-        reward = 0
-        if new_level > old_level:
-            reward = new_level * 20
-            u["coins"] += reward
-        mark_dirty(*key)
-
-        if reward:
-            await message.channel.send(
-                f"🎉 {message.author.mention} reached **level {new_level}**! (+{reward} {COIN})",
-                delete_after=20
-            )
-    except Exception as e:
-        print(f"economy_on_message error: {e}", flush=True)
-
-
-# ----- leaderboard -----
-
-@bot.hybrid_command(name="leaderboard", description="See the top members: richest, highest level, trivia champs, or giveaway winners")
-@app_commands.describe(category="What to rank people by (default: coins)")
-async def leaderboard(ctx, category: typing.Literal["coins", "levels", "trivia", "giveaway-wins"] = "coins"):
-    if not ctx.guild:
-        await ctx.send("This command only works in servers.")
+@bot.hybrid_command(name="leaderboard", description="See the top members — richest, trivia champs, giveaway winners")
+@app_commands.describe(
+    category="What to rank people by (default: coins)",
+    scope="This server only, or across every server ChillBot is in (default: server)"
+)
+async def leaderboard(
+    ctx,
+    category: typing.Literal["coins", "trivia", "giveaway-wins"] = "coins",
+    scope: typing.Literal["server", "global"] = "server",
+):
+    if not ctx.guild and scope == "server":
+        await ctx.send("Server leaderboards only work inside a server — try `scope: global` instead.")
         return
 
-    gid = ctx.guild.id
-    users = economy.get(gid, {})
+    is_global = scope == "global"
+    gid = ctx.guild.id if ctx.guild else None
 
     if category == "coins":
         title = f"{COIN} Richest Members"
-        data = {uid: u["coins"] for uid, u in users.items() if u["coins"] > 0}
+        data = aggregate_global("coins") if is_global else {uid: u["coins"] for uid, u in economy.get(gid, {}).items() if u["coins"] > 0}
 
         def fmt(value):
             return f"**{value:,}** {COIN}"
-    elif category == "levels":
-        title = "⭐ Highest Level Members"
-        data = {uid: u["xp"] for uid, u in users.items() if u["xp"] > 0}
-
-        def fmt(value):
-            return f"Level **{level_from_xp(value)[0]}** • {value:,} XP"
     elif category == "trivia":
         title = "🧠 Trivia Champions"
-        data = {uid: u["trivia_points"] for uid, u in users.items() if u["trivia_points"] > 0}
+        data = aggregate_global("trivia_points") if is_global else {uid: u["trivia_points"] for uid, u in economy.get(gid, {}).items() if u["trivia_points"] > 0}
 
         def fmt(value):
             return f"**{value:,}** pts"
     else:
         title = "🏆 Giveaway Winners"
-        data = dict(win_counts.get(gid, {}))
+        if is_global:
+            totals = {}
+            for guild_wins in win_counts.values():
+                for uid, wins in guild_wins.items():
+                    totals[uid] = totals.get(uid, 0) + wins
+            data = totals
+        else:
+            data = dict(win_counts.get(gid, {}))
 
         def fmt(value):
             return f"**{value}** win{'s' if value != 1 else ''}"
+
+    title += " (Global)" if is_global else " (This Server)"
 
     if not data:
         await ctx.send("Nobody is on this leaderboard yet — chat, claim `/daily`, or start a `/trivia`!")
@@ -1474,7 +1526,7 @@ async def leaderboard(ctx, category: typing.Literal["coins", "levels", "trivia",
         prefix = MEDALS[i] if i < 3 else f"**{i + 1}.**"
         lines.append(f"{prefix} <@{uid}> — {fmt(value)}")
 
-    embed = discord.Embed(title=title, description="\n".join(lines), color=get_guild_color(gid))
+    embed = discord.Embed(title=title, description="\n".join(lines), color=get_guild_color(gid) if gid else DEFAULT_COLOR)
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     your_pos = next((i for i, (uid, _) in enumerate(ranked, start=1) if uid == ctx.author.id), None)
     footer = f"Your rank: #{your_pos}" if your_pos else "You're not ranked yet"
@@ -1482,7 +1534,7 @@ async def leaderboard(ctx, category: typing.Literal["coins", "levels", "trivia",
     await ctx.send(embed=embed)
 
 
-# ----- balance / daily / work / rank -----
+# ----- balance / daily / work -----
 
 @bot.hybrid_command(name="balance", description="Check how many coins you (or someone else) have")
 @app_commands.describe(member="Whose balance to check (default: you)")
@@ -1499,14 +1551,15 @@ async def balance_cmd(ctx, member: typing.Optional[discord.Member] = None):
         return
 
     u = get_user(ctx.guild.id, target.id)
-    level = level_from_xp(u["xp"])[0]
     position = rank_position(ctx.guild.id, target.id, "coins")
 
     embed = discord.Embed(title=f"{COIN} {target.display_name}'s Balance", color=get_guild_color(ctx.guild.id))
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="Coins", value=f"**{u['coins']:,}** {COIN}", inline=True)
     embed.add_field(name="Wealth rank", value=f"#{position}" if position else "Unranked", inline=True)
-    embed.add_field(name="Level", value=str(level), inline=True)
+
+    if active_multiplier(u) > 1:
+        embed.add_field(name="Active boost", value=f"{u.get('boost_name', 'Boost')} — ends {fmt_ts(u['boost_until'])}", inline=True)
 
     if target.id == ctx.author.id:
         now = time.time()
@@ -1542,21 +1595,23 @@ async def daily_cmd(ctx):
         await ctx.send(embed=embed, ephemeral=True)
         return
 
-    # keep the streak alive if the last claim was within 48 hours
     if u["last_daily"] and now - u["last_daily"] < 172800:
         streak = u["streak"] + 1
     else:
         streak = 1
 
-    reward = DAILY_BASE + DAILY_STREAK_BONUS * min(streak - 1, 10)
+    base_reward = DAILY_BASE + DAILY_STREAK_BONUS * min(streak - 1, 10)
+    mult = active_multiplier(u)
+    reward = base_reward * mult
     u["coins"] += reward
     u["last_daily"] = now
     u["streak"] = streak
     mark_dirty(ctx.guild.id, ctx.author.id)
 
+    boost_note = f" (**{mult}x** boost applied!)" if mult > 1 else ""
     embed = discord.Embed(
         title="🎁 Daily Reward",
-        description=f"You claimed **{reward}** {COIN}!\n\n**Balance:** {u['coins']:,} {COIN}",
+        description=f"You claimed **{reward}** {COIN}{boost_note}!\n\n**Balance:** {u['coins']:,} {COIN}",
         color=discord.Color.green()
     )
     embed.add_field(name="Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
@@ -1600,52 +1655,119 @@ async def work_cmd(ctx):
         return
 
     text, low, high = random.choice(WORK_JOBS)
-    earned = random.randint(low, high)
+    mult = active_multiplier(u)
+    earned = random.randint(low, high) * mult
     u["coins"] += earned
     u["last_work"] = now
     mark_dirty(ctx.guild.id, ctx.author.id)
 
+    boost_note = f" (**{mult}x** boost applied!)" if mult > 1 else ""
     embed = discord.Embed(
         title="💼 Work",
-        description=f"{text} and earned **{earned}** {COIN}!\n\n**Balance:** {u['coins']:,} {COIN}",
+        description=f"{text} and earned **{earned}** {COIN}{boost_note}!\n\n**Balance:** {u['coins']:,} {COIN}",
         color=discord.Color.green()
     )
     embed.set_footer(text="You can work again in 1 hour • ChillBot 😎")
     await ctx.send(embed=embed)
 
 
-@bot.hybrid_command(name="rank", description="Show your level card and XP progress")
-@app_commands.describe(member="Whose rank card to show (default: you)")
+# ----- shop -----
+
+class ShopView(discord.ui.View):
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        for item in SHOP_ITEMS:
+            self.add_item(ShopBuyButton(item))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your shop menu — run `/shop` yourself!", ephemeral=True)
+            return False
+        return True
+
+
+class ShopBuyButton(discord.ui.Button):
+    def __init__(self, item):
+        super().__init__(label=f"Buy — {item['price']:,} 🪙", style=discord.ButtonStyle.success)
+        self.item = item
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ShopView = self.view
+        u = get_user(view.guild_id, view.user_id)
+
+        if u["coins"] < self.item["price"]:
+            await interaction.response.send_message(
+                f"You need **{self.item['price']:,}** {COIN} for that, but you only have **{u['coins']:,}** {COIN}.",
+                ephemeral=True
+            )
+            return
+
+        u["coins"] -= self.item["price"]
+        u["boost_multiplier"] = self.item["multiplier"]
+        u["boost_until"] = time.time() + self.item["hours"] * 3600
+        u["boost_name"] = self.item["name"]
+        mark_dirty(view.guild_id, view.user_id)
+
+        embed = discord.Embed(
+            title="✅ Purchase complete!",
+            description=f"You bought **{self.item['name']}**.\n\nActive until {fmt_ts(u['boost_until'])}.\n\n**Balance:** {u['coins']:,} {COIN}",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="ChillBot 😎")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.hybrid_command(name="shop", description="Spend your coins on boosts and power-ups")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-async def rank_cmd(ctx, member: typing.Optional[discord.Member] = None):
+async def shop_cmd(ctx):
     if not ctx.guild:
         await ctx.send("This command only works in servers.")
         return
 
-    target = member or ctx.author
-    if target.bot:
-        await ctx.send("Bots don't earn XP 🤖")
+    u = get_user(ctx.guild.id, ctx.author.id)
+    embed = discord.Embed(
+        title="🛒 ChillBot Shop",
+        description=f"You have **{u['coins']:,}** {COIN}\n\nPick a boost to buy below:",
+        color=get_guild_color(ctx.guild.id)
+    )
+    for item in SHOP_ITEMS:
+        embed.add_field(name=f"{item['name']} — {item['price']:,} {COIN}", value=item["desc"], inline=False)
+    if active_multiplier(u) > 1:
+        embed.add_field(name="Currently active", value=f"{u.get('boost_name')} — ends {fmt_ts(u['boost_until'])}", inline=False)
+    embed.set_footer(text="Buying a new boost replaces any boost currently active • ChillBot 😎")
+
+    view = ShopView(ctx.guild.id, ctx.author.id)
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.hybrid_command(name="give-coins", description="[Owner only] Give yourself coins")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(amount="How many coins to add to your own balance")
+async def give_coins_cmd(ctx, amount: int):
+    if ctx.author.id != OWNER_ID:
+        await ctx.send("This command is not available to you.", ephemeral=True)
+        return
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if amount < 1 or amount > 1_000_000:
+        await ctx.send("Amount must be between 1 and 1,000,000.", ephemeral=True)
         return
 
-    u = get_user(ctx.guild.id, target.id)
-    level, into_level, needed = level_from_xp(u["xp"])
-    position = rank_position(ctx.guild.id, target.id, "xp")
-    bar = progress_bar(into_level, needed)
-    percent = int(100 * into_level / needed) if needed else 0
+    u = get_user(ctx.guild.id, ctx.author.id)
+    u["coins"] += amount
+    mark_dirty(ctx.guild.id, ctx.author.id)
 
-    embed = discord.Embed(title=f"⭐ {target.display_name}'s Rank Card", color=get_guild_color(ctx.guild.id))
-    embed.set_thumbnail(url=target.display_avatar.url)
-    embed.description = (
-        f"**Level {level}**\n"
-        f"{bar} **{percent}%**\n"
-        f"`{into_level:,} / {needed:,} XP` to level {level + 1}"
+    embed = discord.Embed(
+        description=f"👑 Added **{amount:,}** {COIN} to your balance.\n\n**New balance:** {u['coins']:,} {COIN}",
+        color=discord.Color.gold()
     )
-    embed.add_field(name="Server rank", value=f"#{position}" if position else "Unranked", inline=True)
-    embed.add_field(name="Total XP", value=f"{u['xp']:,}", inline=True)
-    embed.add_field(name="Coins", value=f"{u['coins']:,} {COIN}", inline=True)
-    embed.set_footer(text="Chat to earn XP — one reward per minute • ChillBot 😎")
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, ephemeral=True)
 
 
 # ----- trivia -----
@@ -1726,7 +1848,7 @@ class TriviaButton(discord.ui.Button):
 class TriviaView(discord.ui.View):
     def __init__(self, option_count):
         super().__init__(timeout=None)
-        self.answers = {}   # user_id -> (chosen index, time clicked)
+        self.answers = {}
         self.closed = False
         for i in range(option_count):
             self.add_item(TriviaButton(i))
@@ -1775,7 +1897,7 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
                 f"Click a button to lock in your answer (you only get one try).\n\n"
                 f"✅ Correct answer = **10 points**\n"
                 f"⚡ Fastest correct answers get a bonus: +{TRIVIA_BONUS[0]}, +{TRIVIA_BONUS[1]}, +{TRIVIA_BONUS[2]}\n"
-                f"{COIN} Every point is also added to your coins!"
+                f"{COIN} Every point is also added to your coins (boosts apply)!"
             ),
             color=DEFAULT_COLOR
         )
@@ -1803,7 +1925,6 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
             msg = await channel.send(embed=question_embed, view=view)
             await asyncio.sleep(TRIVIA_SECONDS)
 
-            # ----- reveal -----
             view.closed = True
             for child in view.children:
                 child.disabled = True
@@ -1816,14 +1937,16 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
                 pts = 10 + (TRIVIA_BONUS[place] if place < len(TRIVIA_BONUS) else 0)
                 scores[uid] = scores.get(uid, 0) + pts
 
-                # points are saved (and turned into coins) right away
                 player = get_user(ctx.guild.id, uid)
+                mult = active_multiplier(player)
+                coins_earned = pts * mult
                 player["trivia_points"] += pts
-                player["coins"] += pts
+                player["coins"] += coins_earned
                 mark_dirty(ctx.guild.id, uid)
 
                 if place < 8:
-                    winner_lines.append(f"<@{uid}> +{pts}")
+                    boost_tag = f" ({mult}x)" if mult > 1 else ""
+                    winner_lines.append(f"<@{uid}> +{pts} pts / +{coins_earned}{COIN}{boost_tag}")
 
             reveal_options = "\n".join(
                 f"{'✅ ' if i == correct_index else ''}**{letters[i]})** {opt}" for i, opt in enumerate(options)
@@ -1849,7 +1972,6 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
             if n < total:
                 await asyncio.sleep(4)
 
-        # ----- final results -----
         if scores:
             description = "**Final standings:**\n" + scoreboard_text(scores, limit=10)
         else:
@@ -2175,9 +2297,8 @@ async def meme(ctx):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def coinflip(ctx):
     result = random.choice(["Heads", "Tails"])
-    emoji = "🪙"
     embed = discord.Embed(
-        title=f"{emoji} Coin Flip",
+        title="🪙 Coin Flip",
         description=f"The coin landed on **{result}**!",
         color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
@@ -2217,8 +2338,6 @@ class RPSView(discord.ui.View):
 
         self.choices[user_id] = choice
         await interaction.response.send_message(f"You picked **{choice}** {RPS_EMOJIS[choice]}", ephemeral=True)
-
-        opponent_id = self.player2_id if self.player2_id else "BOT"
 
         if self.player2_id is None:
             bot_choice = random.choice(list(RPS_EMOJIS.keys()))
@@ -2306,6 +2425,337 @@ async def ping(ctx):
         color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
     await ctx.send(embed=embed)
+
+
+# ---------- HIGHER OR LOWER (reposts a fresh embed each turn) ----------
+
+class HigherLowerView(discord.ui.View):
+    def __init__(self, player_id, deck, current_card, channel):
+        super().__init__(timeout=60)
+        self.player_id = player_id
+        self.deck = deck
+        self.current_card = current_card
+        self.score = 0
+        self.channel = channel
+
+    @staticmethod
+    def card_label(card):
+        rank, suit = card
+        return f"{rank}{suit}"
+
+    def build_embed(self, desc, color):
+        embed = discord.Embed(title="🎴 Higher or Lower", description=desc, color=color)
+        embed.set_footer(text="ChillBot 😎")
+        return embed
+
+    async def guess(self, interaction: discord.Interaction, direction: str):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+
+        # freeze the old message so it doesn't look like there are two live games
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        if not self.deck:
+            await interaction.response.defer()
+            return
+
+        next_card = self.deck.pop()
+        current_value = self.current_card[2]
+        next_value = next_card[2]
+
+        correct = (direction == "higher" and next_value > current_value) or \
+                  (direction == "lower" and next_value < current_value) or \
+                  (next_value == current_value)
+
+        new_view = HigherLowerView(self.player_id, self.deck, next_card, self.channel)
+        new_view.score = self.score
+
+        if correct:
+            new_view.score += 1
+            desc = f"**{self.card_label(next_card)}** — Correct! 🎉\nScore: **{new_view.score}**\n\nNext card, higher or lower than **{self.card_label(next_card)}**?"
+            color = discord.Color.green()
+        else:
+            desc = f"**{self.card_label(next_card)}** — Wrong! 💀\nFinal score: **{new_view.score}**"
+            color = discord.Color.red()
+            for child in new_view.children:
+                child.disabled = True
+
+        if not new_view.deck:
+            for child in new_view.children:
+                child.disabled = True
+            desc += "\n\n🎉 You cleared the whole deck!"
+
+        embed = new_view.build_embed(desc, color)
+        await interaction.response.send_message(embed=embed, view=new_view)
+
+    @discord.ui.button(label="⬆️ Higher", style=discord.ButtonStyle.green)
+    async def higher_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.guess(interaction, "higher")
+
+    @discord.ui.button(label="⬇️ Lower", style=discord.ButtonStyle.red)
+    async def lower_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.guess(interaction, "lower")
+
+
+@bot.hybrid_command(name="higher-lower", description="Guess if the next card is higher or lower")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def higher_lower(ctx):
+    ranks = [("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6), ("7", 7), ("8", 8),
+             ("9", 9), ("10", 10), ("J", 11), ("Q", 12), ("K", 13), ("A", 14)]
+    suits = ["♠️", "♥️", "♦️", "♣️"]
+    deck = [(rank, suit, value) for rank, value in ranks for suit in suits]
+    random.shuffle(deck)
+
+    current_card = deck.pop()
+    view = HigherLowerView(ctx.author.id, deck, current_card, ctx.channel)
+
+    embed = discord.Embed(
+        title="🎴 Higher or Lower",
+        description=f"Current card: **{current_card[0]}{current_card[1]}**\n\nWill the next card be higher or lower?",
+        color=DEFAULT_COLOR
+    )
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed, view=view)
+
+
+# ---------- MINESWEEPER (interactive — click a bomb and it's game over) ----------
+
+class MinesweeperButton(discord.ui.Button):
+    def __init__(self, index):
+        super().__init__(label="\u200b", style=discord.ButtonStyle.secondary, row=index // 5)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        view: MinesweeperView = self.view
+        await view.reveal(interaction, self.index, self)
+
+
+class MinesweeperView(discord.ui.View):
+    def __init__(self, player_id, size, bombs):
+        super().__init__(timeout=180)
+        self.player_id = player_id
+        self.size = size
+        self.total_cells = size * size
+        self.bomb_positions = set(random.sample(range(self.total_cells), bombs))
+        self.revealed = set()
+        self.over = False
+        self.digit_emojis = ["", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+
+        for i in range(self.total_cells):
+            self.add_item(MinesweeperButton(i))
+
+    def neighbors(self, pos):
+        row, col = divmod(pos, self.size)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                r, c = row + dr, col + dc
+                if 0 <= r < self.size and 0 <= c < self.size:
+                    yield r * self.size + c
+
+    def build_embed(self, status):
+        safe_cells = self.total_cells - len(self.bomb_positions)
+        embed = discord.Embed(
+            title="💣 Minesweeper",
+            description=f"Grid: {self.size}x{self.size} • Bombs: {len(self.bomb_positions)}\n\n{status}",
+            color=DEFAULT_COLOR
+        )
+        embed.add_field(name="Cells revealed", value=f"{len(self.revealed)}/{safe_cells}", inline=True)
+        embed.set_footer(text="ChillBot 😎")
+        return embed
+
+    async def reveal(self, interaction: discord.Interaction, index, button: MinesweeperButton):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        if self.over or index in self.revealed:
+            await interaction.response.defer()
+            return
+
+        if index in self.bomb_positions:
+            self.over = True
+            for child in self.children:
+                if isinstance(child, MinesweeperButton):
+                    if child.index in self.bomb_positions:
+                        child.label = "💣"
+                        child.style = discord.ButtonStyle.danger
+                    child.disabled = True
+            embed = self.build_embed("💥 **BOOM! Game over.**")
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        self.revealed.add(index)
+        count = sum(1 for n in self.neighbors(index) if n in self.bomb_positions)
+        button.label = self.digit_emojis[count] if count else "▫️"
+        button.style = discord.ButtonStyle.success
+        button.disabled = True
+
+        safe_cells = self.total_cells - len(self.bomb_positions)
+        if len(self.revealed) >= safe_cells:
+            self.over = True
+            for child in self.children:
+                child.disabled = True
+            embed = self.build_embed("🎉 **You cleared the board!**")
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        embed = self.build_embed("Keep going — click a cell!")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@bot.hybrid_command(name="minesweeper", description="Click cells to reveal them — hit a bomb and it's game over!")
+@app_commands.describe(size="Grid size (3-5, default 5)", bombs="Number of bombs (default 5)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def minesweeper(ctx, size: typing.Optional[int] = 5, bombs: typing.Optional[int] = 5):
+    if size < 3 or size > 5:
+        await ctx.send("Size must be between 3 and 5 (Discord only allows a 5x5 grid of buttons).")
+        return
+    total_cells = size * size
+    if bombs < 1 or bombs >= total_cells:
+        await ctx.send(f"Bombs must be between 1 and {total_cells - 1}.")
+        return
+
+    view = MinesweeperView(ctx.author.id, size, bombs)
+    embed = view.build_embed("Click a cell to reveal it!")
+    await ctx.send(embed=embed, view=view)
+
+
+# ---------- CONNECT 4 (reposts a fresh embed each turn) ----------
+
+class Connect4View(discord.ui.View):
+    def __init__(self, player1_id, player2_id, board=None, turn=None):
+        super().__init__(timeout=300)
+        self.player1_id = player1_id
+        self.player2_id = player2_id
+        self.board = board if board is not None else [[0] * 7 for _ in range(6)]
+        self.turn = turn if turn is not None else player1_id
+        self.over = False
+
+        for col in range(7):
+            self.add_item(Connect4Button(col))
+
+    def render_board(self):
+        symbols = {0: "⚪", 1: "🔴", 2: "🟡"}
+        return "\n".join("".join(symbols[cell] for cell in row) for row in self.board)
+
+    def drop_piece(self, col, player_num):
+        for row in range(5, -1, -1):
+            if self.board[row][col] == 0:
+                self.board[row][col] = player_num
+                return row
+        return None
+
+    def check_winner(self, player_num):
+        board = self.board
+        for r in range(6):
+            for c in range(4):
+                if all(board[r][c + i] == player_num for i in range(4)):
+                    return True
+        for r in range(3):
+            for c in range(7):
+                if all(board[r + i][c] == player_num for i in range(4)):
+                    return True
+        for r in range(3):
+            for c in range(4):
+                if all(board[r + i][c + i] == player_num for i in range(4)):
+                    return True
+        for r in range(3, 6):
+            for c in range(4):
+                if all(board[r - i][c + i] == player_num for i in range(4)):
+                    return True
+        return False
+
+    def is_full(self):
+        return all(self.board[0][c] != 0 for c in range(7))
+
+
+class Connect4Button(discord.ui.Button):
+    def __init__(self, col):
+        super().__init__(label=str(col + 1), style=discord.ButtonStyle.blurple, row=col // 4)
+        self.col = col
+
+    async def callback(self, interaction: discord.Interaction):
+        view: Connect4View = self.view
+
+        if view.over:
+            await interaction.response.send_message("This game has ended.", ephemeral=True)
+            return
+        if interaction.user.id != view.turn:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        player_num = 1 if interaction.user.id == view.player1_id else 2
+        row = view.drop_piece(self.col, player_num)
+        if row is None:
+            await interaction.response.send_message("That column is full!", ephemeral=True)
+            return
+
+        # freeze this message so only one copy of the board stays interactive
+        for child in view.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=view)
+        except Exception:
+            pass
+
+        if view.check_winner(player_num):
+            view.over = True
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{view.render_board()}\n\n🎉 <@{interaction.user.id}> wins!",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+
+        if view.is_full():
+            view.over = True
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{view.render_board()}\n\n🤝 It's a draw!",
+                color=discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+
+        next_turn = view.player2_id if interaction.user.id == view.player1_id else view.player1_id
+        new_view = Connect4View(view.player1_id, view.player2_id, board=view.board, turn=next_turn)
+        embed = discord.Embed(
+            title="🔴 🟡 Connect 4",
+            description=f"{new_view.render_board()}\n\nIt's <@{next_turn}>'s turn.",
+            color=DEFAULT_COLOR
+        )
+        await interaction.response.send_message(embed=embed, view=new_view)
+
+
+@bot.hybrid_command(name="connect4", description="Play Connect 4 against a friend")
+@app_commands.describe(opponent="Who do you want to challenge?")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def connect4(ctx, opponent: discord.Member):
+    if opponent.bot:
+        await ctx.send("You can't challenge a bot to this game.")
+        return
+    if opponent.id == ctx.author.id:
+        await ctx.send("You can't challenge yourself!")
+        return
+
+    view = Connect4View(ctx.author.id, opponent.id)
+    embed = discord.Embed(
+        title="🔴 🟡 Connect 4",
+        description=f"{view.render_board()}\n\n{ctx.author.mention} (🔴) vs {opponent.mention} (🟡)\n\nIt's {ctx.author.mention}'s turn.",
+        color=DEFAULT_COLOR
+    )
+    await ctx.send(embed=embed, view=view)
 
 
 # ---------- ANYWHERE COMMANDS (work in DMs, group DMs, and servers) ----------
@@ -2403,265 +2853,6 @@ async def wordle(ctx):
     )
     embed.set_footer(text="ChillBot 😎")
     await ctx.send(embed=embed)
-
-
-@bot.hybrid_command(name="minesweeper", description="Generate a spoiler-tag minesweeper grid")
-@app_commands.describe(size="Grid size, e.g. 5 for a 5x5 board (default 5, max 8)", bombs="Number of bombs (default 5)")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def minesweeper(ctx, size: typing.Optional[int] = 5, bombs: typing.Optional[int] = 5):
-    if size < 3 or size > 8:
-        await ctx.send("Size must be between 3 and 8.")
-        return
-    total_cells = size * size
-    if bombs < 1 or bombs >= total_cells:
-        await ctx.send(f"Bombs must be between 1 and {total_cells - 1}.")
-        return
-
-    bomb_positions = set(random.sample(range(total_cells), bombs))
-    digit_emojis = ["⬛", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
-
-    def neighbors(pos):
-        row, col = divmod(pos, size)
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                r, c = row + dr, col + dc
-                if 0 <= r < size and 0 <= c < size:
-                    yield r * size + c
-
-    rows_out = []
-    for row in range(size):
-        cells = []
-        for col in range(size):
-            pos = row * size + col
-            if pos in bomb_positions:
-                cells.append("||💣||")
-            else:
-                count = sum(1 for n in neighbors(pos) if n in bomb_positions)
-                cells.append(f"||{digit_emojis[count]}||")
-        rows_out.append("".join(cells))
-
-    grid_text = "\n".join(rows_out)
-    embed = discord.Embed(
-        title="💣 Minesweeper",
-        description=f"{grid_text}\n\n**Bombs:** {bombs} • **Grid:** {size}x{size}",
-        color=DEFAULT_COLOR
-    )
-    embed.set_footer(text="Tap a spoiler to reveal it • ChillBot 😎")
-    await ctx.send(embed=embed)
-
-
-class HigherLowerView(discord.ui.View):
-    def __init__(self, player_id, deck, current_card):
-        super().__init__(timeout=60)
-        self.player_id = player_id
-        self.deck = deck
-        self.current_card = current_card
-        self.score = 0
-
-    @staticmethod
-    def card_label(card):
-        rank, suit = card
-        return f"{rank}{suit}"
-
-    async def guess(self, interaction: discord.Interaction, direction: str):
-        if interaction.user.id != self.player_id:
-            await interaction.response.send_message("This isn't your game!", ephemeral=True)
-            return
-
-        if not self.deck:
-            for child in self.children:
-                child.disabled = True
-            await interaction.response.edit_message(view=self)
-            return
-
-        next_card = self.deck.pop()
-        current_value = self.current_card[2]
-        next_value = next_card[2]
-
-        correct = (direction == "higher" and next_value > current_value) or \
-                  (direction == "lower" and next_value < current_value) or \
-                  (next_value == current_value)
-
-        if correct:
-            self.score += 1
-            self.current_card = next_card
-            desc = f"**{self.card_label(next_card)}** — Correct! 🎉\nScore: **{self.score}**\n\nNext card, higher or lower than **{self.card_label(next_card)}**?"
-            color = discord.Color.green()
-        else:
-            desc = f"**{self.card_label(next_card)}** — Wrong! 💀\nFinal score: **{self.score}**"
-            color = discord.Color.red()
-            for child in self.children:
-                child.disabled = True
-
-        if not self.deck:
-            for child in self.children:
-                child.disabled = True
-            desc += "\n\n🎉 You cleared the whole deck!"
-
-        embed = discord.Embed(title="🎴 Higher or Lower", description=desc, color=color)
-        embed.set_footer(text="ChillBot 😎")
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(label="⬆️ Higher", style=discord.ButtonStyle.green)
-    async def higher_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.guess(interaction, "higher")
-
-    @discord.ui.button(label="⬇️ Lower", style=discord.ButtonStyle.red)
-    async def lower_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.guess(interaction, "lower")
-
-
-@bot.hybrid_command(name="higher-lower", description="Guess if the next card is higher or lower")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def higher_lower(ctx):
-    ranks = [("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6), ("7", 7), ("8", 8),
-             ("9", 9), ("10", 10), ("J", 11), ("Q", 12), ("K", 13), ("A", 14)]
-    suits = ["♠️", "♥️", "♦️", "♣️"]
-    deck = [(rank, suit, value) for rank, value in ranks for suit in suits]
-    random.shuffle(deck)
-
-    current_card = deck.pop()
-    view = HigherLowerView(ctx.author.id, deck, current_card)
-
-    embed = discord.Embed(
-        title="🎴 Higher or Lower",
-        description=f"Current card: **{current_card[0]}{current_card[1]}**\n\nWill the next card be higher or lower?",
-        color=DEFAULT_COLOR
-    )
-    embed.set_footer(text="ChillBot 😎")
-    await ctx.send(embed=embed, view=view)
-
-
-class Connect4View(discord.ui.View):
-    def __init__(self, player1_id, player2_id):
-        super().__init__(timeout=300)
-        self.player1_id = player1_id
-        self.player2_id = player2_id
-        self.board = [[0] * 7 for _ in range(6)]  # 0 empty, 1 player1, 2 player2
-        self.turn = player1_id
-        self.over = False
-
-        for col in range(7):
-            self.add_item(Connect4Button(col))
-
-    def render_board(self):
-        symbols = {0: "⚪", 1: "🔴", 2: "🟡"}
-        lines = []
-        for row in self.board:
-            lines.append("".join(symbols[cell] for cell in row))
-        return "\n".join(lines)
-
-    def drop_piece(self, col, player_num):
-        for row in range(5, -1, -1):
-            if self.board[row][col] == 0:
-                self.board[row][col] = player_num
-                return row
-        return None
-
-    def check_winner(self, player_num):
-        board = self.board
-        for r in range(6):
-            for c in range(4):
-                if all(board[r][c + i] == player_num for i in range(4)):
-                    return True
-        for r in range(3):
-            for c in range(7):
-                if all(board[r + i][c] == player_num for i in range(4)):
-                    return True
-        for r in range(3):
-            for c in range(4):
-                if all(board[r + i][c + i] == player_num for i in range(4)):
-                    return True
-        for r in range(3, 6):
-            for c in range(4):
-                if all(board[r - i][c + i] == player_num for i in range(4)):
-                    return True
-        return False
-
-    def is_full(self):
-        return all(self.board[0][c] != 0 for c in range(7))
-
-
-class Connect4Button(discord.ui.Button):
-    def __init__(self, col):
-        super().__init__(label=str(col + 1), style=discord.ButtonStyle.blurple, row=col // 4)
-        self.col = col
-
-    async def callback(self, interaction: discord.Interaction):
-        view: Connect4View = self.view
-
-        if view.over:
-            await interaction.response.send_message("This game has ended.", ephemeral=True)
-            return
-        if interaction.user.id != view.turn:
-            await interaction.response.send_message("It's not your turn!", ephemeral=True)
-            return
-
-        player_num = 1 if interaction.user.id == view.player1_id else 2
-        row = view.drop_piece(self.col, player_num)
-        if row is None:
-            await interaction.response.send_message("That column is full!", ephemeral=True)
-            return
-
-        if row == 0:
-            self.disabled = True
-
-        if view.check_winner(player_num):
-            view.over = True
-            for child in view.children:
-                child.disabled = True
-            embed = discord.Embed(
-                title="🔴 🟡 Connect 4",
-                description=f"{view.render_board()}\n\n🎉 <@{interaction.user.id}> wins!",
-                color=discord.Color.green()
-            )
-            await interaction.response.edit_message(embed=embed, view=view)
-            return
-
-        if view.is_full():
-            view.over = True
-            for child in view.children:
-                child.disabled = True
-            embed = discord.Embed(
-                title="🔴 🟡 Connect 4",
-                description=f"{view.render_board()}\n\n🤝 It's a draw!",
-                color=discord.Color.orange()
-            )
-            await interaction.response.edit_message(embed=embed, view=view)
-            return
-
-        view.turn = view.player2_id if interaction.user.id == view.player1_id else view.player1_id
-        embed = discord.Embed(
-            title="🔴 🟡 Connect 4",
-            description=f"{view.render_board()}\n\nIt's <@{view.turn}>'s turn.",
-            color=DEFAULT_COLOR
-        )
-        await interaction.response.edit_message(embed=embed, view=view)
-
-
-@bot.hybrid_command(name="connect4", description="Play Connect 4 against a friend")
-@app_commands.describe(opponent="Who do you want to challenge?")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def connect4(ctx, opponent: discord.Member):
-    if opponent.bot:
-        await ctx.send("You can't challenge a bot to this game.")
-        return
-    if opponent.id == ctx.author.id:
-        await ctx.send("You can't challenge yourself!")
-        return
-
-    view = Connect4View(ctx.author.id, opponent.id)
-    embed = discord.Embed(
-        title="🔴 🟡 Connect 4",
-        description=f"{view.render_board()}\n\n{ctx.author.mention} (🔴) vs {opponent.mention} (🟡)\n\nIt's {ctx.author.mention}'s turn.",
-        color=DEFAULT_COLOR
-    )
-    await ctx.send(embed=embed, view=view)
 
 
 # ---------- MENTION HANDLING ----------
@@ -2780,8 +2971,6 @@ async def on_message(message):
         print(f"on_message error: {e}", flush=True)
 
 
-# XP / levels and the "jailed people get their role back if they rejoin" check run alongside the handlers above
-bot.add_listener(economy_on_message, "on_message")
 bot.add_listener(economy_on_member_join, "on_member_join")
 
 bot.run(os.environ["DISCORD_TOKEN"])
