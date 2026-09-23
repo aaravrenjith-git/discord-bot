@@ -35,7 +35,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)
 
 OWNER_ID = 1160627021865549976
 OWNER_NAME = "Aarav"
@@ -79,6 +79,7 @@ economy_loaded = False
 economy_tasks_started = False
 jail_tasks = {}
 active_trivia = set()
+channel_msg_count = {}   # channel_id -> running count of (non-bot) messages, used to decide when a game should repost
 
 
 def save_giveaway(gid):
@@ -2429,14 +2430,18 @@ async def ping(ctx):
 
 # ---------- HIGHER OR LOWER (reposts a fresh embed each turn) ----------
 
+REPOST_THRESHOLD = 10  # only post a fresh game embed if this many messages have appeared since the last one
+
+
 class HigherLowerView(discord.ui.View):
-    def __init__(self, player_id, deck, current_card, channel):
+    def __init__(self, player_id, deck, current_card, channel, last_count=None):
         super().__init__(timeout=60)
         self.player_id = player_id
         self.deck = deck
         self.current_card = current_card
         self.score = 0
         self.channel = channel
+        self.last_count = last_count if last_count is not None else channel_msg_count.get(channel.id, 0)
 
     @staticmethod
     def card_label(card):
@@ -2453,14 +2458,6 @@ class HigherLowerView(discord.ui.View):
             await interaction.response.send_message("This isn't your game!", ephemeral=True)
             return
 
-        # freeze the old message so it doesn't look like there are two live games
-        for child in self.children:
-            child.disabled = True
-        try:
-            await interaction.message.edit(view=self)
-        except Exception:
-            pass
-
         if not self.deck:
             await interaction.response.defer()
             return
@@ -2473,7 +2470,13 @@ class HigherLowerView(discord.ui.View):
                   (direction == "lower" and next_value < current_value) or \
                   (next_value == current_value)
 
-        new_view = HigherLowerView(self.player_id, self.deck, next_card, self.channel)
+        current_count = channel_msg_count.get(self.channel.id, 0)
+        should_repost = (current_count - self.last_count) >= REPOST_THRESHOLD
+
+        new_view = HigherLowerView(
+            self.player_id, self.deck, next_card, self.channel,
+            last_count=current_count if should_repost else self.last_count
+        )
         new_view.score = self.score
 
         if correct:
@@ -2492,7 +2495,17 @@ class HigherLowerView(discord.ui.View):
             desc += "\n\n🎉 You cleared the whole deck!"
 
         embed = new_view.build_embed(desc, color)
-        await interaction.response.send_message(embed=embed, view=new_view)
+
+        if should_repost:
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
+            await interaction.response.send_message(embed=embed, view=new_view)
+        else:
+            await interaction.response.edit_message(embed=embed, view=new_view)
 
     @discord.ui.button(label="⬆️ Higher", style=discord.ButtonStyle.green)
     async def higher_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2632,13 +2645,15 @@ async def minesweeper(ctx, size: typing.Optional[int] = 5, bombs: typing.Optiona
 # ---------- CONNECT 4 (reposts a fresh embed each turn) ----------
 
 class Connect4View(discord.ui.View):
-    def __init__(self, player1_id, player2_id, board=None, turn=None):
+    def __init__(self, player1_id, player2_id, channel, board=None, turn=None, last_count=None):
         super().__init__(timeout=300)
         self.player1_id = player1_id
         self.player2_id = player2_id
+        self.channel = channel
         self.board = board if board is not None else [[0] * 7 for _ in range(6)]
         self.turn = turn if turn is not None else player1_id
         self.over = False
+        self.last_count = last_count if last_count is not None else channel_msg_count.get(channel.id, 0)
 
         for col in range(7):
             self.add_item(Connect4Button(col))
@@ -2699,42 +2714,65 @@ class Connect4Button(discord.ui.Button):
             await interaction.response.send_message("That column is full!", ephemeral=True)
             return
 
-        # freeze this message so only one copy of the board stays interactive
-        for child in view.children:
-            child.disabled = True
-        try:
-            await interaction.message.edit(view=view)
-        except Exception:
-            pass
+        current_count = channel_msg_count.get(view.channel.id, 0)
+        should_repost = (current_count - view.last_count) >= REPOST_THRESHOLD
 
         if view.check_winner(player_num):
             view.over = True
+            for child in view.children:
+                child.disabled = True
             embed = discord.Embed(
                 title="🔴 🟡 Connect 4",
                 description=f"{view.render_board()}\n\n🎉 <@{interaction.user.id}> wins!",
                 color=discord.Color.green()
             )
-            await interaction.response.send_message(embed=embed)
+            if should_repost:
+                await interaction.response.edit_message(view=view)
+                await interaction.channel.send(embed=embed)
+            else:
+                await interaction.response.edit_message(embed=embed, view=view)
             return
 
         if view.is_full():
             view.over = True
+            for child in view.children:
+                child.disabled = True
             embed = discord.Embed(
                 title="🔴 🟡 Connect 4",
                 description=f"{view.render_board()}\n\n🤝 It's a draw!",
                 color=discord.Color.orange()
             )
-            await interaction.response.send_message(embed=embed)
+            if should_repost:
+                await interaction.response.edit_message(view=view)
+                await interaction.channel.send(embed=embed)
+            else:
+                await interaction.response.edit_message(embed=embed, view=view)
             return
 
         next_turn = view.player2_id if interaction.user.id == view.player1_id else view.player1_id
-        new_view = Connect4View(view.player1_id, view.player2_id, board=view.board, turn=next_turn)
-        embed = discord.Embed(
-            title="🔴 🟡 Connect 4",
-            description=f"{new_view.render_board()}\n\nIt's <@{next_turn}>'s turn.",
-            color=DEFAULT_COLOR
-        )
-        await interaction.response.send_message(embed=embed, view=new_view)
+
+        if should_repost:
+            for child in view.children:
+                child.disabled = True
+            await interaction.response.edit_message(view=view)
+            new_view = Connect4View(
+                view.player1_id, view.player2_id, view.channel,
+                board=view.board, turn=next_turn, last_count=current_count
+            )
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{new_view.render_board()}\n\nIt's <@{next_turn}>'s turn.",
+                color=DEFAULT_COLOR
+            )
+            await interaction.channel.send(embed=embed, view=new_view)
+        else:
+            view.turn = next_turn
+            embed = discord.Embed(
+                title="🔴 🟡 Connect 4",
+                description=f"{view.render_board()}\n\nIt's <@{next_turn}>'s turn.",
+                color=DEFAULT_COLOR
+            )
+            await interaction.response.edit_message(embed=embed, view=view)
 
 
 @bot.hybrid_command(name="connect4", description="Play Connect 4 against a friend")
@@ -2749,7 +2787,7 @@ async def connect4(ctx, opponent: discord.Member):
         await ctx.send("You can't challenge yourself!")
         return
 
-    view = Connect4View(ctx.author.id, opponent.id)
+    view = Connect4View(ctx.author.id, opponent.id, ctx.channel)
     embed = discord.Embed(
         title="🔴 🟡 Connect 4",
         description=f"{view.render_board()}\n\n{ctx.author.mention} (🔴) vs {opponent.mention} (🟡)\n\nIt's {ctx.author.mention}'s turn.",
@@ -2771,6 +2809,51 @@ LANGUAGE_CODES = {
 }
 
 
+HINGLISH_WORDS = {
+    "hai", "hain", "hoon", "hun", "kya", "kyu", "kyun", "kaise", "kaisa", "kaisi",
+    "nahi", "nahin", "haan", "acha", "accha", "achha", "tum", "tumhe", "tumhara",
+    "mujhe", "mera", "meri", "tera", "teri", "uska", "uski", "hum", "humko",
+    "kar", "karo", "karta", "karti", "karte", "raha", "rahi", "rahe", "bhai",
+    "yaar", "kahan", "kab", "thik", "theek", "abhi", "bahut", "bohot", "matlab",
+    "dost", "pyar", "dil", "zindagi", "chahiye", "sahi", "galat", "kuch",
+    "kisi", "koi", "sab", "bilkul", "shayad", "waise", "kyunki", "isliye",
+    "toh", "bhi", "wala", "wali", "log", "aap", "aapka", "aapki", "mein",
+}
+
+
+def is_hinglish(text: str) -> bool:
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    if not words:
+        return False
+    matches = sum(1 for w in words if w in HINGLISH_WORDS)
+    return matches >= 1 and (matches / len(words)) >= 0.2
+
+
+async def transliterate_to_hindi(session, text: str) -> str:
+    """Converts romanized Hindi (Hinglish) to Devanagari script, word by word, using Google's input-tools API."""
+    words = text.split()
+    result_words = []
+    for word in words:
+        stripped = re.sub(r"[^\w']", "", word)
+        if not stripped:
+            result_words.append(word)
+            continue
+        try:
+            async with session.get(
+                "https://inputtools.google.com/request",
+                params={"text": stripped, "itc": "hi-t-i0-und", "num": "1", "cp": "0", "cs": "1", "ie": "utf-8", "oe": "utf-8"}
+            ) as resp:
+                data = await resp.json()
+                if data[0] == "SUCCESS" and data[1] and data[1][0][1]:
+                    hindi_word = data[1][0][1][0]
+                    result_words.append(word.replace(stripped, hindi_word))
+                    continue
+        except Exception as e:
+            print(f"Transliteration error for '{word}': {e}", flush=True)
+        result_words.append(word)
+    return " ".join(result_words)
+
+
 @bot.hybrid_command(name="translate", description="Translate text into another language")
 @app_commands.describe(text="The text to translate", language="Target language, e.g. Spanish or es")
 @app_commands.allowed_installs(guilds=True, users=True)
@@ -2784,9 +2867,28 @@ async def translate(ctx, language: str, *, text: str):
 
     await ctx.defer()
     try:
+        hinglish_detected = is_hinglish(text)
+        display_original = text
+
         async with aiohttp.ClientSession() as session:
-            url = "https://api.mymemory.translated.net/get"
-            params = {"q": text, "langpair": f"autodetect|{target}"}
+            if hinglish_detected:
+                hindi_text = await transliterate_to_hindi(session, text)
+                display_original = f"{text}\n*(romanized Hindi → {hindi_text})*"
+
+                if target == "hi":
+                    embed = discord.Embed(title="🌐 Translation", color=DEFAULT_COLOR)
+                    embed.add_field(name="Original", value=text[:1000], inline=False)
+                    embed.add_field(name="Translated (hi)", value=hindi_text[:1000], inline=False)
+                    embed.set_footer(text="Detected romanized Hindi • ChillBot 😎")
+                    await ctx.send(embed=embed)
+                    return
+
+                url = "https://api.mymemory.translated.net/get"
+                params = {"q": hindi_text, "langpair": f"hi|{target}"}
+            else:
+                url = "https://api.mymemory.translated.net/get"
+                params = {"q": text, "langpair": f"autodetect|{target}"}
+
             async with session.get(url, params=params) as resp:
                 data = await resp.json()
 
@@ -2796,9 +2898,12 @@ async def translate(ctx, language: str, *, text: str):
             return
 
         embed = discord.Embed(title="🌐 Translation", color=DEFAULT_COLOR)
-        embed.add_field(name="Original", value=text[:1000], inline=False)
+        embed.add_field(name="Original", value=display_original[:1000], inline=False)
         embed.add_field(name=f"Translated ({target})", value=translated[:1000], inline=False)
-        embed.set_footer(text="ChillBot 😎")
+        if hinglish_detected:
+            embed.set_footer(text="Detected romanized Hindi • ChillBot 😎")
+        else:
+            embed.set_footer(text="ChillBot 😎")
         await ctx.send(embed=embed)
     except Exception as e:
         print(f"Translate error: {e}", flush=True)
@@ -2908,6 +3013,8 @@ async def on_message(message):
         if message.author.bot:
             return
 
+        channel_msg_count[message.channel.id] = channel_msg_count.get(message.channel.id, 0) + 1
+
         if bot.user in message.mentions:
             await handle_mention(message)
             return
@@ -2957,8 +3064,6 @@ async def on_message(message):
                 if message.author.id not in gw["joined_users"]:
                     continue
                 if not channel_counts(message.guild.id, message.channel.id, gw["channel_id"]):
-                    continue
-                if message.content.startswith("?"):
                     continue
 
                 mult = get_multiplier(message.guild.id, message.author)
