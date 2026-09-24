@@ -71,6 +71,7 @@ log_channels = {}
 default_ping_roles = {}
 embed_colors = {}
 jail_roles = {}
+jail_mod_roles = {}
 
 # economy: economy[guild_id][user_id] = {...}, saved to MongoDB in batches
 economy = {}
@@ -139,6 +140,7 @@ def save_settings(guild_id):
         "default_ping_role": default_ping_roles.get(guild_id),
         "embed_color": embed_colors.get(guild_id),
         "jail_role": jail_roles.get(guild_id),
+        "jail_mod_roles": list(jail_mod_roles.get(guild_id, set())),
     }
 
     def _write():
@@ -178,6 +180,7 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
             embed_colors[guild_id] = doc["embed_color"]
         if doc.get("jail_role"):
             jail_roles[guild_id] = doc["jail_role"]
+        jail_mod_roles[guild_id] = set(doc.get("jail_mod_roles", []))
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -581,16 +584,14 @@ async def help_cmd(ctx):
             "**/higher-lower** — Guess if the next card is higher or lower\n"
             "**/minesweeper** — Click cells, don't hit a bomb!\n"
             "**/connect4** — Challenge a friend to Connect 4\n"
-            "**/ping** — Check ChillBot's latency"
+            "**/ping** — Check ChillBot's latency\n"
+            "**/stats** — See ChillBot's status and uptime"
         ),
         inline=False
     )
     embed.add_field(
         name="🌍 Anywhere (DMs, group chats, or servers)",
-        value=(
-            "**/translate** — Translate text into another language\n"
-            "**/wordle** — Guess the 5-letter word in 6 tries"
-        ),
+        value="**/wordle** — Guess the 5-letter word in 6 tries",
         inline=False
     )
     embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
@@ -623,6 +624,8 @@ async def help_cmd(ctx):
     app_commands.Choice(name="🔇 Remove the default ping role", value="remove_ping_role"),
     app_commands.Choice(name="🔒 Set the jailed role (used by /jail)", value="set_jail_role"),
     app_commands.Choice(name="🔓 Remove the jailed role", value="remove_jail_role"),
+    app_commands.Choice(name="🚔 Allow a role to use /jail and /unjail", value="add_jail_mod_role"),
+    app_commands.Choice(name="🚫 Remove a role's /jail permission", value="remove_jail_mod_role"),
     app_commands.Choice(name="🎨 Set a custom embed color", value="set_embed_color"),
     app_commands.Choice(name="🎨 Reset embed color to default", value="reset_embed_color"),
     app_commands.Choice(name="📝 Set the log channel", value="set_log_channel"),
@@ -646,7 +649,7 @@ async def setup_cmd(
         await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
         return
 
-    if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role", "set_jail_role") and not role:
+    if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role", "set_jail_role", "add_jail_mod_role", "remove_jail_mod_role") and not role:
         await interaction.response.send_message("Please pick a role for this action.", ephemeral=True)
         return
     if act in ("add_channel", "remove_channel", "set_log_channel") and not channel:
@@ -736,6 +739,16 @@ async def setup_cmd(
             "🔓 Jailed role removed. Anyone already jailed keeps the role until their time is up.", ephemeral=True
         )
 
+    elif act == "add_jail_mod_role":
+        jail_mod_roles.setdefault(guild_id, set()).add(role.id)
+        save_settings(guild_id)
+        await interaction.response.send_message(f"🚔 {role.mention} can now use **/jail** and **/unjail**.", ephemeral=True)
+
+    elif act == "remove_jail_mod_role":
+        jail_mod_roles.setdefault(guild_id, set()).discard(role.id)
+        save_settings(guild_id)
+        await interaction.response.send_message(f"❌ {role.mention} can no longer use **/jail** or **/unjail**.", ephemeral=True)
+
     elif act == "set_embed_color":
         hex_clean = color if color.startswith("#") else f"#{color}"
         embed_colors[guild_id] = hex_clean
@@ -765,6 +778,7 @@ async def setup_cmd(
         mults = multiplier_roles.get(guild_id, {})
         ping_role_id = default_ping_roles.get(guild_id)
         jail_role_id = jail_roles.get(guild_id)
+        jail_mods = jail_mod_roles.get(guild_id, set())
         log_channel_id = log_channels.get(guild_id)
         color_hex = embed_colors.get(guild_id, "Default")
 
@@ -774,6 +788,7 @@ async def setup_cmd(
         mults_txt = ", ".join(f"<@&{r}> ({m}x)" for r, m in mults.items()) or "None"
         ping_txt = f"<@&{ping_role_id}>" if ping_role_id else "None"
         jail_txt = f"<@&{jail_role_id}>" if jail_role_id else "Not set"
+        jail_mods_txt = ", ".join(f"<@&{r}>" for r in jail_mods) or "None (Admins & Moderate Members only)"
         log_txt = f"<#{log_channel_id}>" if log_channel_id else "Not set"
 
         embed = discord.Embed(title="⚙️ Giveaway Settings", color=get_guild_color(guild_id))
@@ -784,6 +799,7 @@ async def setup_cmd(
         embed.add_field(name="Bonus entry roles", value=mults_txt, inline=False)
         embed.add_field(name="Default ping role", value=ping_txt, inline=True)
         embed.add_field(name="Jailed role", value=jail_txt, inline=True)
+        embed.add_field(name="Who can use /jail", value=jail_mods_txt, inline=False)
         embed.add_field(name="Embed color", value=color_hex, inline=True)
         embed.add_field(name="Log channel", value=log_txt, inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1994,7 +2010,11 @@ async def trivia_cmd(ctx, rounds: typing.Optional[int] = 5):
 # ----- jail -----
 
 def can_jail(member: discord.Member):
-    return is_admin_or_owner(member) or member.guild_permissions.moderate_members
+    if is_admin_or_owner(member) or member.guild_permissions.moderate_members:
+        return True
+    allowed = jail_mod_roles.get(member.guild.id, set())
+    user_role_ids = {r.id for r in member.roles}
+    return len(allowed & user_role_ids) > 0
 
 
 def schedule_jail_release(guild_id, user_id, until_ts):
@@ -2076,7 +2096,7 @@ async def jail_cmd(ctx, member: discord.Member, duration: str, reason: typing.Op
         return
 
     if not can_jail(ctx.author):
-        await ctx.send("You need the **Moderate Members** permission (or be an admin) to jail people.", ephemeral=True)
+        await ctx.send("You don't have permission to jail people. An admin can grant this with **/setup**.", ephemeral=True)
         return
 
     role_id = jail_roles.get(ctx.guild.id)
@@ -2172,7 +2192,7 @@ async def unjail_cmd(ctx, member: discord.Member):
         return
 
     if not can_jail(ctx.author):
-        await ctx.send("You need the **Moderate Members** permission (or be an admin) to release people.", ephemeral=True)
+        await ctx.send("You don't have permission to release people. An admin can grant this with **/setup**.", ephemeral=True)
         return
 
     u = economy.get(ctx.guild.id, {}).get(member.id)
@@ -2425,6 +2445,27 @@ async def ping(ctx):
         description=f"🏓 Pong! **{latency}ms**",
         color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="stats", description="See ChillBot's status, latency and uptime")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def stats_cmd(ctx):
+    active_count = sum(
+        1 for gw in giveaways.values()
+        if gw["active"] and (not ctx.guild or gw["guild_id"] == ctx.guild.id)
+    )
+    embed = discord.Embed(title="😎 ChillBot Status", color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR)
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="Status", value="🟢 Online", inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Uptime", value=get_uptime_string(), inline=True)
+    if ctx.guild:
+        embed.add_field(name="Active giveaways here", value=str(active_count), inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Owner", value=OWNER_NAME, inline=True)
+    embed.set_footer(text="ChillBot 😎")
     await ctx.send(embed=embed)
 
 
@@ -2798,118 +2839,6 @@ async def connect4(ctx, opponent: discord.Member):
 
 # ---------- ANYWHERE COMMANDS (work in DMs, group DMs, and servers) ----------
 
-LANGUAGE_CODES = {
-    "english": "en", "spanish": "es", "french": "fr", "german": "de",
-    "italian": "it", "portuguese": "pt", "dutch": "nl", "russian": "ru",
-    "japanese": "ja", "korean": "ko", "chinese": "zh", "arabic": "ar",
-    "hindi": "hi", "turkish": "tr", "polish": "pl", "swedish": "sv",
-    "greek": "el", "hebrew": "he", "vietnamese": "vi", "thai": "th",
-    "indonesian": "id", "tamil": "ta", "malayalam": "ml", "bengali": "bn",
-    "urdu": "ur",
-}
-
-
-HINGLISH_WORDS = {
-    "hai", "hain", "hoon", "hun", "kya", "kyu", "kyun", "kaise", "kaisa", "kaisi",
-    "nahi", "nahin", "haan", "acha", "accha", "achha", "tum", "tumhe", "tumhara",
-    "mujhe", "mera", "meri", "tera", "teri", "uska", "uski", "hum", "humko",
-    "kar", "karo", "karta", "karti", "karte", "raha", "rahi", "rahe", "bhai",
-    "yaar", "kahan", "kab", "thik", "theek", "abhi", "bahut", "bohot", "matlab",
-    "dost", "pyar", "dil", "zindagi", "chahiye", "sahi", "galat", "kuch",
-    "kisi", "koi", "sab", "bilkul", "shayad", "waise", "kyunki", "isliye",
-    "toh", "bhi", "wala", "wali", "log", "aap", "aapka", "aapki", "mein",
-}
-
-
-def is_hinglish(text: str) -> bool:
-    words = re.findall(r"[a-zA-Z]+", text.lower())
-    if not words:
-        return False
-    matches = sum(1 for w in words if w in HINGLISH_WORDS)
-    return matches >= 1 and (matches / len(words)) >= 0.2
-
-
-async def transliterate_to_hindi(session, text: str) -> str:
-    """Converts romanized Hindi (Hinglish) to Devanagari script, word by word, using Google's input-tools API."""
-    words = text.split()
-    result_words = []
-    for word in words:
-        stripped = re.sub(r"[^\w']", "", word)
-        if not stripped:
-            result_words.append(word)
-            continue
-        try:
-            async with session.get(
-                "https://inputtools.google.com/request",
-                params={"text": stripped, "itc": "hi-t-i0-und", "num": "1", "cp": "0", "cs": "1", "ie": "utf-8", "oe": "utf-8"}
-            ) as resp:
-                data = await resp.json()
-                if data[0] == "SUCCESS" and data[1] and data[1][0][1]:
-                    hindi_word = data[1][0][1][0]
-                    result_words.append(word.replace(stripped, hindi_word))
-                    continue
-        except Exception as e:
-            print(f"Transliteration error for '{word}': {e}", flush=True)
-        result_words.append(word)
-    return " ".join(result_words)
-
-
-@bot.hybrid_command(name="translate", description="Translate text into another language")
-@app_commands.describe(text="The text to translate", language="Target language, e.g. Spanish or es")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def translate(ctx, language: str, *, text: str):
-    if len(text) > 500:
-        await ctx.send("Text is too long (max 500 characters).")
-        return
-
-    target = LANGUAGE_CODES.get(language.strip().lower(), language.strip().lower())
-
-    await ctx.defer()
-    try:
-        hinglish_detected = is_hinglish(text)
-        display_original = text
-
-        async with aiohttp.ClientSession() as session:
-            if hinglish_detected:
-                hindi_text = await transliterate_to_hindi(session, text)
-                display_original = f"{text}\n*(romanized Hindi → {hindi_text})*"
-
-                if target == "hi":
-                    embed = discord.Embed(title="🌐 Translation", color=DEFAULT_COLOR)
-                    embed.add_field(name="Original", value=text[:1000], inline=False)
-                    embed.add_field(name="Translated (hi)", value=hindi_text[:1000], inline=False)
-                    embed.set_footer(text="Detected romanized Hindi • ChillBot 😎")
-                    await ctx.send(embed=embed)
-                    return
-
-                url = "https://api.mymemory.translated.net/get"
-                params = {"q": hindi_text, "langpair": f"hi|{target}"}
-            else:
-                url = "https://api.mymemory.translated.net/get"
-                params = {"q": text, "langpair": f"autodetect|{target}"}
-
-            async with session.get(url, params=params) as resp:
-                data = await resp.json()
-
-        translated = data.get("responseData", {}).get("translatedText")
-        if not translated:
-            await ctx.send("Couldn't translate that — check the language name/code and try again.")
-            return
-
-        embed = discord.Embed(title="🌐 Translation", color=DEFAULT_COLOR)
-        embed.add_field(name="Original", value=display_original[:1000], inline=False)
-        embed.add_field(name=f"Translated ({target})", value=translated[:1000], inline=False)
-        if hinglish_detected:
-            embed.set_footer(text="Detected romanized Hindi • ChillBot 😎")
-        else:
-            embed.set_footer(text="ChillBot 😎")
-        await ctx.send(embed=embed)
-    except Exception as e:
-        print(f"Translate error: {e}", flush=True)
-        await ctx.send("Something went wrong translating that, try again.")
-
-
 WORDLE_WORDS = [
     "apple", "beach", "chair", "dance", "eagle", "flame", "grape", "house",
     "input", "joker", "knife", "lemon", "mango", "night", "ocean", "piano",
@@ -2980,29 +2909,7 @@ async def handle_mention(message):
     if message.author.id == OWNER_ID:
         await message.channel.send(random.choice(OWNER_REPLIES))
         return
-
-    if message.guild and is_admin_or_owner(message.author):
-        active_count = sum(1 for gw in giveaways.values() if gw["active"] and gw["guild_id"] == message.guild.id)
-        embed = discord.Embed(
-            title="😎 ChillBot Status",
-            color=get_guild_color(message.guild.id)
-        )
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
-        embed.add_field(name="Status", value="🟢 Online", inline=True)
-        embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-        embed.add_field(name="Uptime", value=get_uptime_string(), inline=True)
-        embed.add_field(name="Active giveaways here", value=str(active_count), inline=True)
-        embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
-        embed.add_field(name="Owner", value=OWNER_NAME, inline=True)
-        embed.set_footer(text="ChillBot 😎")
-        await message.channel.send(embed=embed)
-        return
-
-    embed = discord.Embed(
-        description="Hey there! 👋 Use **/help** to see what I can do.",
-        color=get_guild_color(message.guild.id) if message.guild else DEFAULT_COLOR
-    )
-    await message.channel.send(embed=embed)
+    # Everyone else: no special reply. They can use /help or /stats.
 
 
 # ---------- MESSAGE HANDLING ----------
