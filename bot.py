@@ -83,7 +83,7 @@ active_trivia = set()
 channel_msg_count = {}   # channel_id -> running count of (non-bot) messages, used to decide when a game should repost
 
 
-def save_giveaway(gid):
+async def save_giveaway(gid):
     gw = giveaways.get(gid)
     if not gw:
         return
@@ -104,15 +104,14 @@ def save_giveaway(gid):
     }
 
     def _write():
-        try:
-            giveaways_col.replace_one({"_id": gid}, doc, upsert=True)
-        except Exception as e:
-            print(f"DB save_giveaway error: {e}", flush=True)
+        giveaways_col.replace_one({"_id": gid}, doc, upsert=True)
 
     try:
-        bot.loop.run_in_executor(None, _write)
+        # awaited so a crash right after this call can never lose the write —
+        # a giveaway being created or joined is important enough to wait the extra moment for
+        await asyncio.wait_for(asyncio.to_thread(_write), timeout=8)
     except Exception as e:
-        print(f"DB save_giveaway schedule error: {e}", flush=True)
+        print(f"DB save_giveaway error: {e}", flush=True)
 
 
 def delete_giveaway_doc(gid):
@@ -402,7 +401,7 @@ class ConfirmLeaveView(discord.ui.View):
 
         gw["joined_users"].discard(self.user_id)
         gw["entries"] = [uid for uid in gw["entries"] if uid != self.user_id]
-        save_giveaway(self.giveaway_id)
+        await save_giveaway(self.giveaway_id)
 
         for child in self.children:
             child.disabled = True
@@ -461,7 +460,7 @@ class GiveawayView(discord.ui.View):
                         return
 
             gw["joined_users"].add(user.id)
-            save_giveaway(self.giveaway_id)
+            await save_giveaway(self.giveaway_id)
             await interaction.response.send_message(
                 "✅ You joined! Send messages in the allowed channel(s) to rack up entries. Click again to leave.",
                 ephemeral=True
@@ -858,7 +857,7 @@ async def publish_giveaway(ctx, duration, prize, winners, required_role, blackli
         "active": True,
         "end_time": end_time,
     }
-    save_giveaway(msg.id)
+    await save_giveaway(msg.id)
 
     embed.set_footer(text=f"Giveaway ID: {msg.id} • ChillBot 😎", icon_url=bot.user.display_avatar.url)
     await msg.edit(embed=embed, view=view)
@@ -1130,7 +1129,7 @@ async def remove_participant(ctx, message_id: str, member: discord.Member):
         return
     gw["joined_users"].discard(member.id)
     gw["entries"] = [uid for uid in gw["entries"] if uid != member.id]
-    save_giveaway(gid)
+    await save_giveaway(gid)
     await ctx.send(f"Removed {member.mention} from that giveaway.")
 
     log_embed = discord.Embed(
@@ -1256,7 +1255,7 @@ async def edit_giveaway(
             return
         gw["winners"] = winners
 
-    save_giveaway(gid)
+    await save_giveaway(gid)
 
     channel = bot.get_channel(gw["channel_id"])
     if channel:
@@ -2962,7 +2961,7 @@ async def on_message(message):
                 mult = get_multiplier(message.guild.id, message.author)
                 for _ in range(mult):
                     gw["entries"].append(message.author.id)
-                save_giveaway(gid)
+                await save_giveaway(gid)
 
         await bot.process_commands(message)
     except Exception as e:
