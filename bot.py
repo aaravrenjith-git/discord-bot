@@ -71,6 +71,18 @@ log_channels = {}
 default_ping_roles = {}
 embed_colors = {}
 jail_roles = {}
+staff_roles = {}       # guild_id -> set(role_ids) — separate from giveaway authorized_roles
+update_channels = {}   # guild_id -> channel_id — where auto changelog posts go
+
+# ---------- CHANGELOG (edit these two lines whenever you ship an update) ----------
+CURRENT_VERSION = "1.0"
+CHANGELOG_ENTRIES = [
+    "Added moderation commands: /ban, /kick, /mute, /unmute, /warn, /warnings",
+    "Added a separate /staffsetup command for staff roles and the update log channel",
+    "Added this auto-updating changelog system",
+]
+
+meta_col = db["meta"]
 
 # economy: economy[guild_id][user_id] = {...}, saved to MongoDB in batches
 economy = {}
@@ -139,6 +151,8 @@ def save_settings(guild_id):
         "default_ping_role": default_ping_roles.get(guild_id),
         "embed_color": embed_colors.get(guild_id),
         "jail_role": jail_roles.get(guild_id),
+        "staff_roles": list(staff_roles.get(guild_id, set())),
+        "update_channel": update_channels.get(guild_id),
     }
 
     def _write():
@@ -185,6 +199,9 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
             embed_colors[guild_id] = doc["embed_color"]
         if doc.get("jail_role"):
             jail_roles[guild_id] = doc["jail_role"]
+        staff_roles[guild_id] = set(doc.get("staff_roles", []))
+        if doc.get("update_channel"):
+            update_channels[guild_id] = doc["update_channel"]
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -317,6 +334,39 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             await channel.send(embed=embed)
         except Exception as e:
             print(f"Failed to send log: {e}", flush=True)
+
+
+async def log_command_usage(guild, user, channel, command_name):
+    """Logs every command invocation to this server's log channel (set via /setup)."""
+    if not guild:
+        return
+    channel_id = log_channels.get(guild.id)
+    if not channel_id:
+        return
+    log_channel = guild.get_channel(channel_id)
+    if not log_channel:
+        return
+    where = channel.mention if channel else "an unknown channel"
+    embed = discord.Embed(
+        description=f"🛠️ {user.mention} used **/{command_name}** in {where}",
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text=f"{user} • {user.id}")
+    try:
+        await log_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Command log error: {e}", flush=True)
+
+
+@bot.before_invoke
+async def global_command_logger(ctx):
+    """Fires for every hybrid/prefix command right before it runs — covers everything
+    except the two pure app_commands.Command commands (/setup, /staffsetup), which log
+    themselves manually since they never pass through this ext.commands hook."""
+    if ctx.guild and ctx.command:
+        bot.loop.create_task(
+            log_command_usage(ctx.guild, ctx.author, ctx.channel, ctx.command.qualified_name)
+        )
 
 
 class ParticipantsView(discord.ui.View):
@@ -505,6 +555,51 @@ async def on_ready():
     except Exception as e:
         print(f"load_all_data error: {e}", flush=True)
     start_economy_tasks()
+    await post_changelog_if_new_version()
+
+
+def fetch_last_version_sync():
+    doc = meta_col.find_one({"_id": "version"})
+    return doc["value"] if doc else None
+
+
+def save_current_version_sync():
+    meta_col.replace_one({"_id": "version"}, {"_id": "version", "value": CURRENT_VERSION}, upsert=True)
+
+
+async def post_changelog_if_new_version():
+    try:
+        last_version = await asyncio.wait_for(asyncio.to_thread(fetch_last_version_sync), timeout=8)
+    except Exception as e:
+        print(f"Changelog version check error: {e}", flush=True)
+        return
+
+    if last_version == CURRENT_VERSION:
+        return
+
+    embed = discord.Embed(
+        title=f"🆕 ChillBot Updated — v{CURRENT_VERSION}",
+        description="\n".join(f"• {line}" for line in CHANGELOG_ENTRIES),
+        color=discord.Color.blurple()
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="ChillBot 😎")
+
+    for guild_id, channel_id in list(update_channels.items()):
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                print(f"Failed to post changelog in guild {guild_id}: {e}", flush=True)
+
+    try:
+        await asyncio.to_thread(save_current_version_sync)
+    except Exception as e:
+        print(f"Changelog version save error: {e}", flush=True)
 
 
 @bot.event
@@ -573,7 +668,9 @@ async def help_cmd(ctx):
         name="⚙️ Admin Only",
         value=(
             "**/setup** — Configure host roles, blacklist, channels, ping role, jailed role, embed color, and log channel\n"
-            "**/embed** — Send a custom embed message"
+            "**/embed** — Send a custom embed message\n"
+            "**/stick** — Stick a message to the bottom of a channel (max 5 per server)\n"
+            "**/stopstick** — Remove this channel's sticky message, or all of them"
         ),
         inline=False
     )
@@ -649,6 +746,8 @@ async def setup_cmd(
     if not is_admin_or_owner(interaction.user) and not is_owner_color_override:
         await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
         return
+
+    bot.loop.create_task(log_command_usage(interaction.guild, interaction.user, interaction.channel, "setup"))
 
     if act in ("add_role", "remove_role", "blacklist_role", "unblacklist_role", "add_multiplier", "remove_multiplier", "set_ping_role", "set_jail_role") and not role:
         await interaction.response.send_message("Please pick a role for this action.", ephemeral=True)
@@ -2193,6 +2292,494 @@ async def unjail_cmd(ctx, member: discord.Member):
     await ctx.send(embed=embed)
 
 
+# ---------- STAFF SETUP (separate from /setup) ----------
+
+def can_moderate(member: discord.Member):
+    if is_admin_or_owner(member):
+        return True
+    allowed = staff_roles.get(member.guild.id, set())
+    user_role_ids = {r.id for r in member.roles}
+    return len(allowed & user_role_ids) > 0
+
+
+def check_target_hierarchy(ctx, target: discord.Member):
+    """Returns an error string if the action isn't allowed, or None if it's fine."""
+    if target.bot:
+        return "You can't moderate a bot 🤖"
+    if target.id == ctx.author.id:
+        return "You can't do that to yourself!"
+    if target.id == ctx.guild.owner_id or target.guild_permissions.administrator:
+        return "You can't moderate the server owner or an administrator."
+    if ctx.author.id != ctx.guild.owner_id and target.top_role >= ctx.author.top_role:
+        return "You can only moderate members whose highest role is below yours."
+    return None
+
+
+@bot.tree.command(name="staffsetup", description="[Admin] Configure staff roles and the update log channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    action="Which setting do you want to change?",
+    role="The role to apply this action to (needed for role-based actions)",
+    channel="The channel to apply this action to (needed for the update channel actions)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="➕ Allow a role to use moderation commands", value="add_staff_role"),
+    app_commands.Choice(name="➖ Remove a role's moderation access", value="remove_staff_role"),
+    app_commands.Choice(name="📢 Set the private update log channel", value="set_update_channel"),
+    app_commands.Choice(name="🔕 Remove the update log channel", value="remove_update_channel"),
+    app_commands.Choice(name="📋 Show current staff settings", value="show"),
+])
+async def staffsetup_cmd(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    role: typing.Optional[discord.Role] = None,
+    channel: typing.Optional[discord.TextChannel] = None,
+):
+    if not is_admin_or_owner(interaction.user):
+        await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
+        return
+
+    bot.loop.create_task(log_command_usage(interaction.guild, interaction.user, interaction.channel, "staffsetup"))
+
+    guild_id = interaction.guild.id
+    act = action.value
+
+    if act in ("add_staff_role", "remove_staff_role") and not role:
+        await interaction.response.send_message("Please pick a role for this action.", ephemeral=True)
+        return
+    if act == "set_update_channel" and not channel:
+        await interaction.response.send_message("Please pick a channel for this action.", ephemeral=True)
+        return
+
+    if act == "add_staff_role":
+        staff_roles.setdefault(guild_id, set()).add(role.id)
+        save_settings(guild_id)
+        await interaction.response.send_message(f"✅ {role.mention} can now use moderation commands (ban, kick, mute, warn).", ephemeral=True)
+
+    elif act == "remove_staff_role":
+        staff_roles.setdefault(guild_id, set()).discard(role.id)
+        save_settings(guild_id)
+        await interaction.response.send_message(f"❌ {role.mention} can no longer use moderation commands.", ephemeral=True)
+
+    elif act == "set_update_channel":
+        update_channels[guild_id] = channel.id
+        save_settings(guild_id)
+        await interaction.response.send_message(
+            f"✅ ChillBot update announcements will now be posted in {channel.mention}. "
+            "Make sure this is a private/staff-only channel!", ephemeral=True
+        )
+
+    elif act == "remove_update_channel":
+        update_channels.pop(guild_id, None)
+        save_settings(guild_id)
+        await interaction.response.send_message("❌ Update log channel removed.", ephemeral=True)
+
+    elif act == "show":
+        roles = staff_roles.get(guild_id, set())
+        chan_id = update_channels.get(guild_id)
+        roles_txt = ", ".join(f"<@&{r}>" for r in roles) or "None (Admins only)"
+        chan_txt = f"<#{chan_id}>" if chan_id else "Not set"
+
+        embed = discord.Embed(title="🛡️ Staff Settings", color=get_guild_color(guild_id))
+        embed.add_field(name="Who can use moderation commands", value=roles_txt, inline=False)
+        embed.add_field(name="Update log channel", value=chan_txt, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------- MODERATION: BAN, KICK, MUTE, WARN ----------
+
+@bot.hybrid_command(name="ban", description="Ban a member from the server")
+@app_commands.default_permissions(ban_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to ban", reason="Why they're being banned")
+async def ban_cmd(ctx, member: discord.Member, reason: typing.Optional[str] = "No reason given"):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    error = check_target_hierarchy(ctx, member)
+    if error:
+        await ctx.send(error, ephemeral=True)
+        return
+    if len(reason) > 400:
+        await ctx.send("Reason is too long (max 400 characters).", ephemeral=True)
+        return
+
+    try:
+        await member.ban(reason=f"By {ctx.author} ({ctx.author.id}): {reason}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to ban that member. Check my role position and **Ban Members** permission.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Ban error: {e}", flush=True)
+        await ctx.send("Something went wrong banning that member, try again.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🔨 **{member}** was banned || {reason}",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"By {ctx.author.display_name} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="🔨 Member Banned", description=f"{member.mention} banned by {ctx.author.mention}", color=discord.Color.red())
+    log_embed.add_field(name="Reason", value=reason, inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="kick", description="Kick a member from the server")
+@app_commands.default_permissions(kick_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to kick", reason="Why they're being kicked")
+async def kick_cmd(ctx, member: discord.Member, reason: typing.Optional[str] = "No reason given"):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    error = check_target_hierarchy(ctx, member)
+    if error:
+        await ctx.send(error, ephemeral=True)
+        return
+    if len(reason) > 400:
+        await ctx.send("Reason is too long (max 400 characters).", ephemeral=True)
+        return
+
+    try:
+        await member.kick(reason=f"By {ctx.author} ({ctx.author.id}): {reason}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to kick that member. Check my role position and **Kick Members** permission.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Kick error: {e}", flush=True)
+        await ctx.send("Something went wrong kicking that member, try again.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"👢 **{member}** was kicked || {reason}",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"By {ctx.author.display_name} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="👢 Member Kicked", description=f"{member.mention} kicked by {ctx.author.mention}", color=discord.Color.orange())
+    log_embed.add_field(name="Reason", value=reason, inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="mute", description="Timeout a member so they can't chat or speak")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to mute", duration="How long, e.g. 10m, 2h, 1d (max 28 days)", reason="Why they're being muted")
+async def mute_cmd(ctx, member: discord.Member, duration: str, reason: typing.Optional[str] = "No reason given"):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    error = check_target_hierarchy(ctx, member)
+    if error:
+        await ctx.send(error, ephemeral=True)
+        return
+
+    seconds = parse_duration(duration)
+    if seconds is None:
+        await ctx.send("Invalid duration. Use formats like `10m`, `2h`, `1d`, or `1h30m`.", ephemeral=True)
+        return
+    if seconds > 28 * 86400:
+        await ctx.send("Discord only allows timeouts up to 28 days.", ephemeral=True)
+        return
+    if len(reason) > 400:
+        await ctx.send("Reason is too long (max 400 characters).", ephemeral=True)
+        return
+
+    until = discord.utils.utcnow() + datetime.timedelta(seconds=seconds)
+    try:
+        await member.timeout(until, reason=f"By {ctx.author} ({ctx.author.id}): {reason}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to mute that member. Check my role position and **Moderate Members** permission.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Mute error: {e}", flush=True)
+        await ctx.send("Something went wrong muting that member, try again.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🔇 **{member}** was muted || {reason}",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Duration", value=duration, inline=True)
+    embed.add_field(name="Ends", value=discord.utils.format_dt(until, style="R"), inline=True)
+    embed.set_footer(text=f"By {ctx.author.display_name} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="🔇 Member Muted", description=f"{member.mention} muted by {ctx.author.mention} until {discord.utils.format_dt(until, 'f')}", color=discord.Color.orange())
+    log_embed.add_field(name="Reason", value=reason, inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="unmute", description="Remove a member's timeout early")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to unmute")
+async def unmute_cmd(ctx, member: discord.Member):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    if not member.is_timed_out():
+        await ctx.send(f"{member.mention} isn't muted.", ephemeral=True)
+        return
+
+    try:
+        await member.timeout(None, reason=f"Unmuted by {ctx.author} ({ctx.author.id})")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to unmute that member.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🔊 **{member}** was unmuted by {ctx.author.mention}",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="warn", description="Give a member a warning")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to warn", reason="Why they're being warned")
+async def warn_cmd(ctx, member: discord.Member, reason: str):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    error = check_target_hierarchy(ctx, member)
+    if error:
+        await ctx.send(error, ephemeral=True)
+        return
+    if len(reason) > 400:
+        await ctx.send("Reason is too long (max 400 characters).", ephemeral=True)
+        return
+
+    u = get_user(ctx.guild.id, member.id)
+    warnings = u.setdefault("warnings", [])
+    warnings.append({"reason": reason, "mod_id": ctx.author.id, "timestamp": time.time()})
+    if len(warnings) > 20:
+        u["warnings"] = warnings[-20:]
+    mark_dirty(ctx.guild.id, member.id)
+
+    embed = discord.Embed(
+        description=f"⚠️ **{member}** was warned || {reason}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="Total warnings", value=str(len(u["warnings"])), inline=True)
+    embed.set_footer(text=f"By {ctx.author.display_name} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="⚠️ Member Warned", description=f"{member.mention} warned by {ctx.author.mention}", color=discord.Color.gold())
+    log_embed.add_field(name="Reason", value=reason, inline=False)
+    log_embed.add_field(name="Total warnings", value=str(len(u["warnings"])), inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="warnings", description="Show a member's warning history")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Whose warnings to view")
+async def warnings_cmd(ctx, member: discord.Member):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    u = economy.get(ctx.guild.id, {}).get(member.id, {})
+    warnings = u.get("warnings", [])
+    if not warnings:
+        await ctx.send(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+
+    lines = [
+        f"**{i+1}.** {w['reason']} — by <@{w['mod_id']}> {fmt_ts(w['timestamp'])}"
+        for i, w in enumerate(warnings[-10:])
+    ]
+    embed = discord.Embed(
+        title=f"⚠️ Warnings for {member.display_name}",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Total: {len(warnings)} • ChillBot 😎")
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+# ---------- STICKY MESSAGES ----------
+
+MAX_STICKY_MESSAGES = 5
+sticky_messages = {}  # guild_id -> {channel_id: {"content": str, "message_id": int, "author_id": int}}
+
+
+def build_sticky_embed(content, author):
+    embed = discord.Embed(
+        description=content,
+        color=DEFAULT_COLOR
+    )
+    footer_name = author.display_name if author else "ChillBot"
+    embed.set_footer(text=f"📌 Stickied by {footer_name} • ChillBot 😎")
+    return embed
+
+
+async def repost_sticky(channel: discord.TextChannel):
+    """Deletes the previous sticky post in this channel (if any) and resends it at the bottom."""
+    guild_stickies = sticky_messages.get(channel.guild.id)
+    if not guild_stickies:
+        return
+    sticky = guild_stickies.get(channel.id)
+    if not sticky:
+        return
+
+    old_id = sticky.get("message_id")
+    if old_id:
+        try:
+            old_msg = await channel.fetch_message(old_id)
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    author = channel.guild.get_member(sticky["author_id"])
+    embed = build_sticky_embed(sticky["content"], author)
+    try:
+        new_msg = await channel.send(embed=embed)
+        sticky["message_id"] = new_msg.id
+    except Exception as e:
+        print(f"Sticky repost error: {e}", flush=True)
+
+
+@bot.hybrid_command(name="stick", description="[Admin] Stick a message to the bottom of this channel")
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(message="The text to keep stuck at the bottom of this channel")
+async def stick_cmd(ctx, *, message: str):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use sticky messages.", ephemeral=True)
+        return
+    if len(message) > 1500:
+        await ctx.send("Sticky message is too long (max 1500 characters).", ephemeral=True)
+        return
+
+    guild_stickies = sticky_messages.setdefault(ctx.guild.id, {})
+
+    if ctx.channel.id not in guild_stickies and len(guild_stickies) >= MAX_STICKY_MESSAGES:
+        await ctx.send(
+            f"❌ This server already has the max of **{MAX_STICKY_MESSAGES}** sticky messages. "
+            "Remove one with `/stopstick` in that channel first.",
+            ephemeral=True
+        )
+        return
+
+    # remove any old sticky message already posted in this channel first
+    old = guild_stickies.get(ctx.channel.id)
+    if old and old.get("message_id"):
+        try:
+            old_msg = await ctx.channel.fetch_message(old["message_id"])
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    embed = build_sticky_embed(message, ctx.author)
+    posted = await ctx.channel.send(embed=embed)
+
+    guild_stickies[ctx.channel.id] = {
+        "content": message,
+        "message_id": posted.id,
+        "author_id": ctx.author.id,
+    }
+
+    await ctx.send(f"📌 Message stuck in {ctx.channel.mention} ({len(guild_stickies)}/{MAX_STICKY_MESSAGES} used).", ephemeral=True)
+
+
+@bot.hybrid_command(name="stopstick", description="[Admin] Remove this channel's sticky message, or every sticky in the server")
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(scope="Remove just this channel's sticky, or every sticky in the server (default: this channel)")
+@app_commands.choices(scope=[
+    app_commands.Choice(name="This channel only", value="here"),
+    app_commands.Choice(name="All channels", value="all"),
+])
+async def stopstick_cmd(ctx, scope: typing.Optional[app_commands.Choice[str]] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use sticky messages.", ephemeral=True)
+        return
+
+    scope_value = scope.value if scope else "here"
+    guild_stickies = sticky_messages.get(ctx.guild.id, {})
+
+    if scope_value == "all":
+        if not guild_stickies:
+            await ctx.send("There are no sticky messages in this server.", ephemeral=True)
+            return
+
+        removed = 0
+        for channel_id, sticky in list(guild_stickies.items()):
+            channel = ctx.guild.get_channel(channel_id)
+            if channel and sticky.get("message_id"):
+                try:
+                    old_msg = await channel.fetch_message(sticky["message_id"])
+                    await old_msg.delete()
+                except Exception:
+                    pass
+            removed += 1
+
+        sticky_messages[ctx.guild.id] = {}
+        await ctx.send(f"🧹 Removed all **{removed}** sticky message(s) in this server.", ephemeral=True)
+        return
+
+    sticky = guild_stickies.get(ctx.channel.id)
+    if not sticky:
+        await ctx.send("There's no sticky message in this channel.", ephemeral=True)
+        return
+
+    if sticky.get("message_id"):
+        try:
+            old_msg = await ctx.channel.fetch_message(sticky["message_id"])
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    guild_stickies.pop(ctx.channel.id, None)
+    await ctx.send("🧹 Sticky message removed from this channel.", ephemeral=True)
+
+
 # ---------- FUN COMMANDS ----------
 
 EIGHT_BALL_ANSWERS = [
@@ -2962,6 +3549,10 @@ async def on_message(message):
                 for _ in range(mult):
                     gw["entries"].append(message.author.id)
                 await save_giveaway(gid)
+
+            guild_stickies = sticky_messages.get(message.guild.id)
+            if guild_stickies and message.channel.id in guild_stickies:
+                await repost_sticky(message.channel)
 
         await bot.process_commands(message)
     except Exception as e:
