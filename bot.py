@@ -153,6 +153,9 @@ def save_settings(guild_id):
         "jail_role": jail_roles.get(guild_id),
         "staff_roles": list(staff_roles.get(guild_id, set())),
         "update_channel": update_channels.get(guild_id),
+        "sticky_messages": {
+            str(chan_id): sticky for chan_id, sticky in sticky_messages.get(guild_id, {}).items()
+        },
     }
 
     def _write():
@@ -202,6 +205,10 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
         staff_roles[guild_id] = set(doc.get("staff_roles", []))
         if doc.get("update_channel"):
             update_channels[guild_id] = doc["update_channel"]
+        if doc.get("sticky_messages"):
+            sticky_messages[guild_id] = {
+                int(chan_id): sticky for chan_id, sticky in doc["sticky_messages"].items()
+            }
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -336,9 +343,19 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
             print(f"Failed to send log: {e}", flush=True)
 
 
+LOGGED_COMMANDS = {
+    "setup", "staffsetup", "ban", "kick", "mute", "unmute", "warn", "warnings",
+    "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
+    "edit-giveaway", "remove-participant", "embed", "stick", "stopstick",
+    "give-coins",
+}
+
+
 async def log_command_usage(guild, user, channel, command_name):
-    """Logs every command invocation to this server's log channel (set via /setup)."""
-    if not guild:
+    """Logs moderation/admin command usage to this server's log channel (set via /setup).
+    Only commands in LOGGED_COMMANDS are recorded, to keep the log channel readable —
+    fun/game commands like /ping or /8ball are not logged."""
+    if not guild or command_name not in LOGGED_COMMANDS:
         return
     channel_id = log_channels.get(guild.id)
     if not channel_id:
@@ -596,6 +613,15 @@ async def post_changelog_if_new_version():
             except Exception as e:
                 print(f"Failed to post changelog in guild {guild_id}: {e}", flush=True)
 
+    # also DM the owner directly, in case they're not watching an update channel right now
+    try:
+        owner_user = await bot.fetch_user(OWNER_ID)
+        dm_embed = embed.copy()
+        dm_embed.set_footer(text="Posted in every configured update channel too • ChillBot 😎")
+        await owner_user.send(embed=dm_embed)
+    except Exception as e:
+        print(f"Failed to DM owner about update: {e}", flush=True)
+
     try:
         await asyncio.to_thread(save_current_version_sync)
     except Exception as e:
@@ -659,8 +685,11 @@ async def help_cmd(ctx):
     embed.add_field(
         name="🚔 Moderators",
         value=(
-            "**/jail** — Give a member the jailed role for a set time\n"
-            "**/unjail** — Let someone out of jail early"
+            "**/ban** / **/kick** — Remove a member from the server\n"
+            "**/mute** / **/unmute** — Timeout a member so they can't chat\n"
+            "**/warn** / **/warnings** — Log a warning or view someone's history\n"
+            "**/jail** / **/unjail** — Give a member the jailed role for a set time\n"
+            "**/userinfo** / **/avatar** — Look up a member's info or profile picture"
         ),
         inline=False
     )
@@ -668,9 +697,12 @@ async def help_cmd(ctx):
         name="⚙️ Admin Only",
         value=(
             "**/setup** — Configure host roles, blacklist, channels, ping role, jailed role, embed color, and log channel\n"
+            "**/staffsetup** — Configure who can use moderation commands, and the update log channel\n"
             "**/embed** — Send a custom embed message\n"
-            "**/stick** — Stick a message to the bottom of a channel (max 5 per server)\n"
-            "**/stopstick** — Remove this channel's sticky message, or all of them"
+            "**/stick** / **/stopstick** — Stick or unstick a message at the bottom of a channel (max 5 per server)\n"
+            "**/purge** — Bulk delete recent messages\n"
+            "**/slowmode** — Set a channel's slowmode delay\n"
+            "**/lock** / **/unlock** — Stop or allow @everyone from sending messages here"
         ),
         inline=False
     )
@@ -694,7 +726,49 @@ async def help_cmd(ctx):
         value="**/wordle** — Guess the 5-letter word in 6 tries",
         inline=False
     )
+    embed.add_field(
+        name="ℹ️ Everyone",
+        value="**/serverinfo** — Show info about this server",
+        inline=False
+    )
     embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+# ---------- STATS COMMAND ----------
+
+def get_uptime_string():
+    delta = datetime.datetime.now(datetime.timezone.utc) - BOT_START_TIME
+    days, remainder = divmod(int(delta.total_seconds()), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+@bot.hybrid_command(name="stats", description="Show ChillBot's live status")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def stats_cmd(ctx):
+    active_count = sum(
+        1 for gw in giveaways.values()
+        if gw["active"] and (not ctx.guild or gw["guild_id"] == ctx.guild.id)
+    )
+    embed = discord.Embed(title="😎 ChillBot Status", color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR)
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="Status", value="🟢 Online", inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="Uptime", value=get_uptime_string(), inline=True)
+    if ctx.guild:
+        embed.add_field(name="Active giveaways here", value=str(active_count), inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Owner", value=OWNER_NAME, inline=True)
+    embed.set_footer(text=f"Version {CURRENT_VERSION} • ChillBot 😎")
     await ctx.send(embed=embed)
 
 
@@ -932,7 +1006,6 @@ async def publish_giveaway(ctx, duration, prize, winners, required_role, blackli
     guild_color = get_guild_color(ctx.guild.id)
     timestamp = discord.utils.format_dt(end_time, style="R")
 
-    # a fresh embed is built here, separate from the preview shown during confirmation
     embed = build_giveaway_embed(ctx, prize, winners, timestamp, required_role, blacklist_role, bypass_role, image_url, guild_color)
     embed.set_footer(text="Starting... • ChillBot 😎", icon_url=bot.user.display_avatar.url)
 
@@ -1099,7 +1172,6 @@ async def end_giveaway(giveaway_id):
 
     now = datetime.datetime.now(datetime.timezone.utc)
     if now < gw["end_time"]:
-        # end_time was pushed later (e.g. via /edit-giveaway) — wait again instead of ending early
         bot.loop.create_task(resume_giveaway_timer(giveaway_id, gw["end_time"]))
         return
 
@@ -1437,10 +1509,10 @@ async def embed_cmd(
 COIN = "🪙"
 MEDALS = ["🥇", "🥈", "🥉"]
 DAILY_BASE = 100
-DAILY_STREAK_BONUS = 25     # extra coins per streak day (up to 10 extra days)
-WORK_COOLDOWN = 3600        # 1 hour
-TRIVIA_SECONDS = 20         # time to answer each question
-TRIVIA_BONUS = [5, 3, 1]    # speed bonus for the 1st, 2nd and 3rd correct answer
+DAILY_STREAK_BONUS = 25
+WORK_COOLDOWN = 3600
+TRIVIA_SECONDS = 20
+TRIVIA_BONUS = [5, 3, 1]
 JAIL_MAX_SECONDS = 30 * 86400
 
 DEFAULT_USER = {
@@ -1454,6 +1526,7 @@ DEFAULT_USER = {
     "boost_multiplier": 1,
     "boost_until": 0.0,
     "boost_name": None,
+    "warnings": [],
 }
 
 SHOP_ITEMS = [
@@ -1471,6 +1544,7 @@ def get_user(guild_id, user_id):
     u = users.get(user_id)
     if u is None:
         u = dict(DEFAULT_USER)
+        u["warnings"] = []
         users[user_id] = u
     return u
 
@@ -1515,7 +1589,6 @@ def fmt_ts(ts, style="R"):
 # ----- saving / loading -----
 
 def flush_economy_sync(batch):
-    """Blocking MongoDB writes — runs in a background thread."""
     for doc in batch:
         users_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
 
@@ -1558,6 +1631,7 @@ async def apply_user_data(user_docs):
         gid = doc["guild_id"]
         uid = doc["user_id"]
         u = dict(DEFAULT_USER)
+        u["warnings"] = []
         for key in DEFAULT_USER:
             if key in doc:
                 u[key] = doc[key]
@@ -1905,7 +1979,6 @@ TRIVIA_FALLBACK = [
 
 
 async def fetch_trivia_questions(amount):
-    """Gets questions from Open Trivia DB; falls back to a built-in list if that's unavailable."""
     try:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -2148,7 +2221,6 @@ async def release_jail(guild_id, user_id, released_by=None):
 
 
 async def economy_on_member_join(member):
-    """If someone leaves the server to dodge jail, they get the jailed role back when they rejoin."""
     try:
         u = economy.get(member.guild.id, {}).get(member.id)
         if not u or not u.get("jailed_until"):
@@ -2303,7 +2375,6 @@ def can_moderate(member: discord.Member):
 
 
 def check_target_hierarchy(ctx, target: discord.Member):
-    """Returns an error string if the action isn't allowed, or None if it's fine."""
     if target.bot:
         return "You can't moderate a bot 🤖"
     if target.id == ctx.author.id:
@@ -2356,7 +2427,12 @@ async def staffsetup_cmd(
     if act == "add_staff_role":
         staff_roles.setdefault(guild_id, set()).add(role.id)
         save_settings(guild_id)
-        await interaction.response.send_message(f"✅ {role.mention} can now use moderation commands (ban, kick, mute, warn).", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ {role.mention} can now use moderation commands (ban, kick, mute, warn).\n"
+            f"💡 They still need to see the commands — in Server Settings → Integrations → ChillBot, "
+            f"add this role to each moderation command you want them to use.",
+            ephemeral=True
+        )
 
     elif act == "remove_staff_role":
         staff_roles.setdefault(guild_id, set()).discard(role.id)
@@ -2429,6 +2505,53 @@ async def ban_cmd(ctx, member: discord.Member, reason: typing.Optional[str] = "N
     await ctx.send(embed=embed)
 
     log_embed = discord.Embed(title="🔨 Member Banned", description=f"{member.mention} banned by {ctx.author.mention}", color=discord.Color.red())
+    log_embed.add_field(name="Reason", value=reason, inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="unban", description="Unban a user by their ID")
+@app_commands.default_permissions(ban_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(user_id="The banned user's ID (right-click → Copy User ID with Developer Mode on)", reason="Why they're being unbanned")
+async def unban_cmd(ctx, user_id: str, reason: typing.Optional[str] = "No reason given"):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    try:
+        uid = int(user_id)
+    except ValueError:
+        await ctx.send("That doesn't look like a valid user ID.", ephemeral=True)
+        return
+
+    try:
+        ban_entry = await ctx.guild.fetch_ban(discord.Object(id=uid))
+    except discord.NotFound:
+        await ctx.send("That user isn't banned here.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Fetch ban error: {e}", flush=True)
+        await ctx.send("Something went wrong looking up that ban, try again.", ephemeral=True)
+        return
+
+    try:
+        await ctx.guild.unban(ban_entry.user, reason=f"By {ctx.author} ({ctx.author.id}): {reason}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to unban that user.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"✅ **{ban_entry.user}** was unbanned || {reason}",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text=f"By {ctx.author.display_name} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="✅ Member Unbanned", description=f"{ban_entry.user} unbanned by {ctx.author.mention}", color=discord.Color.green())
     log_embed.add_field(name="Reason", value=reason, inline=False)
     await send_log(ctx.guild, log_embed)
 
@@ -2602,6 +2725,38 @@ async def warn_cmd(ctx, member: discord.Member, reason: str):
     await send_log(ctx.guild, log_embed)
 
 
+@bot.hybrid_command(name="clearwarnings", description="Clear all of a member's warnings")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Whose warnings to clear")
+async def clearwarnings_cmd(ctx, member: discord.Member):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    u = economy.get(ctx.guild.id, {}).get(member.id)
+    if not u or not u.get("warnings"):
+        await ctx.send(f"{member.mention} has no warnings.", ephemeral=True)
+        return
+
+    count = len(u["warnings"])
+    u["warnings"] = []
+    mark_dirty(ctx.guild.id, member.id)
+
+    embed = discord.Embed(
+        description=f"🧹 Cleared **{count}** warning(s) for {member.mention}.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+    log_embed = discord.Embed(title="🧹 Warnings Cleared", description=f"{member.mention}'s warnings cleared by {ctx.author.mention}", color=discord.Color.green())
+    await send_log(ctx.guild, log_embed)
+
+
 @bot.hybrid_command(name="warnings", description="Show a member's warning history")
 @app_commands.default_permissions(moderate_members=True)
 @app_commands.allowed_installs(guilds=True, users=False)
@@ -2635,6 +2790,202 @@ async def warnings_cmd(ctx, member: discord.Member):
     await ctx.send(embed=embed, ephemeral=True)
 
 
+# ---------- MODERATION: PURGE, SLOWMODE, LOCK/UNLOCK ----------
+
+@bot.hybrid_command(name="purge", description="Bulk delete recent messages in this channel")
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(amount="How many messages to delete (1-100)", member="Only delete messages from this member (optional)")
+async def purge_cmd(ctx, amount: int, member: typing.Optional[discord.Member] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+    if amount < 1 or amount > 100:
+        await ctx.send("Amount must be between 1 and 100.", ephemeral=True)
+        return
+
+    def check(m):
+        return member is None or m.author.id == member.id
+
+    try:
+        deleted = await ctx.channel.purge(limit=amount, check=check)
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to delete messages here. Check my **Manage Messages** permission.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Purge error: {e}", flush=True)
+        await ctx.send("Something went wrong deleting messages (Discord can't bulk-delete messages older than 14 days).", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🧹 Deleted **{len(deleted)}** message(s)" + (f" from {member.mention}" if member else ""),
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="🧹 Messages Purged",
+        description=f"{ctx.author.mention} deleted **{len(deleted)}** message(s) in {ctx.channel.mention}" + (f" from {member.mention}" if member else ""),
+        color=discord.Color.orange()
+    )
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="slowmode", description="Set this channel's slowmode delay")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(seconds="Delay in seconds between messages (0 to turn off, max 21600)")
+async def slowmode_cmd(ctx, seconds: int):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+    if seconds < 0 or seconds > 21600:
+        await ctx.send("Slowmode must be between 0 and 21600 seconds (6 hours).", ephemeral=True)
+        return
+
+    try:
+        await ctx.channel.edit(slowmode_delay=seconds)
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to edit this channel.", ephemeral=True)
+        return
+
+    if seconds == 0:
+        await ctx.send("✅ Slowmode turned off for this channel.")
+    else:
+        await ctx.send(f"🐢 Slowmode set to **{seconds}** second(s) for this channel.")
+
+
+@bot.hybrid_command(name="lock", description="Stop @everyone from sending messages in this channel")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(reason="Optional reason shown in the lock message")
+async def lock_cmd(ctx, reason: typing.Optional[str] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    everyone = ctx.guild.default_role
+    try:
+        await ctx.channel.set_permissions(everyone, send_messages=False, reason=f"Locked by {ctx.author}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to edit this channel's permissions.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🔒 This channel has been locked by {ctx.author.mention}." + (f"\n**Reason:** {reason}" if reason else ""),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="unlock", description="Allow @everyone to send messages in this channel again")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def unlock_cmd(ctx):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+
+    everyone = ctx.guild.default_role
+    try:
+        await ctx.channel.set_permissions(everyone, send_messages=None, reason=f"Unlocked by {ctx.author}")
+    except discord.Forbidden:
+        await ctx.send("I don't have permission to edit this channel's permissions.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        description=f"🔓 This channel has been unlocked by {ctx.author.mention}.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+
+# ---------- UTILITY: USERINFO, SERVERINFO, AVATAR ----------
+
+@bot.hybrid_command(name="userinfo", description="Show info about a member")
+@app_commands.describe(member="Whose info to show (default: you)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def userinfo_cmd(ctx, member: typing.Optional[discord.Member] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    target = member or ctx.author
+    roles = [r.mention for r in reversed(target.roles) if not r.is_default()]
+    roles_text = ", ".join(roles[:15]) if roles else "None"
+    if len(roles) > 15:
+        roles_text += f" (+{len(roles) - 15} more)"
+
+    embed = discord.Embed(title=f"ℹ️ {target}", color=get_guild_color(ctx.guild.id))
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="ID", value=str(target.id), inline=True)
+    embed.add_field(name="Nickname", value=target.nick or "None", inline=True)
+    embed.add_field(name="Bot?", value="Yes" if target.bot else "No", inline=True)
+    embed.add_field(name="Account created", value=discord.utils.format_dt(target.created_at, "R"), inline=True)
+    if target.joined_at:
+        embed.add_field(name="Joined server", value=discord.utils.format_dt(target.joined_at, "R"), inline=True)
+    if target.is_timed_out():
+        embed.add_field(name="Muted until", value=discord.utils.format_dt(target.timed_out_until, "R"), inline=True)
+    embed.add_field(name=f"Roles ({len(roles)})", value=roles_text, inline=False)
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="serverinfo", description="Show info about this server")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def serverinfo_cmd(ctx):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+
+    guild = ctx.guild
+    text_channels = len(guild.text_channels)
+    voice_channels = len(guild.voice_channels)
+
+    embed = discord.Embed(title=f"ℹ️ {guild.name}", color=get_guild_color(guild.id))
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
+    embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+    embed.add_field(name="Created", value=discord.utils.format_dt(guild.created_at, "R"), inline=True)
+    embed.add_field(name="Text channels", value=str(text_channels), inline=True)
+    embed.add_field(name="Voice channels", value=str(voice_channels), inline=True)
+    embed.add_field(name="Roles", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="Boost level", value=f"Level {guild.premium_tier} ({guild.premium_subscription_count} boosts)", inline=True)
+    embed.set_footer(text=f"ID: {guild.id} • ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="avatar", description="Show a member's profile picture")
+@app_commands.describe(member="Whose avatar to show (default: you)")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def avatar_cmd(ctx, member: typing.Optional[discord.Member] = None):
+    target = member or ctx.author
+    embed = discord.Embed(title=f"{target.display_name}'s Avatar", color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR)
+    embed.set_image(url=target.display_avatar.url)
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
 # ---------- STICKY MESSAGES ----------
 
 MAX_STICKY_MESSAGES = 5
@@ -2652,7 +3003,6 @@ def build_sticky_embed(content, author):
 
 
 async def repost_sticky(channel: discord.TextChannel):
-    """Deletes the previous sticky post in this channel (if any) and resends it at the bottom."""
     guild_stickies = sticky_messages.get(channel.guild.id)
     if not guild_stickies:
         return
@@ -2673,6 +3023,7 @@ async def repost_sticky(channel: discord.TextChannel):
     try:
         new_msg = await channel.send(embed=embed)
         sticky["message_id"] = new_msg.id
+        save_settings(channel.guild.id)
     except Exception as e:
         print(f"Sticky repost error: {e}", flush=True)
 
@@ -2703,7 +3054,6 @@ async def stick_cmd(ctx, *, message: str):
         )
         return
 
-    # remove any old sticky message already posted in this channel first
     old = guild_stickies.get(ctx.channel.id)
     if old and old.get("message_id"):
         try:
@@ -2720,6 +3070,7 @@ async def stick_cmd(ctx, *, message: str):
         "message_id": posted.id,
         "author_id": ctx.author.id,
     }
+    save_settings(ctx.guild.id)
 
     await ctx.send(f"📌 Message stuck in {ctx.channel.mention} ({len(guild_stickies)}/{MAX_STICKY_MESSAGES} used).", ephemeral=True)
 
@@ -2761,6 +3112,7 @@ async def stopstick_cmd(ctx, scope: typing.Optional[app_commands.Choice[str]] = 
             removed += 1
 
         sticky_messages[ctx.guild.id] = {}
+        save_settings(ctx.guild.id)
         await ctx.send(f"🧹 Removed all **{removed}** sticky message(s) in this server.", ephemeral=True)
         return
 
@@ -2777,6 +3129,7 @@ async def stopstick_cmd(ctx, scope: typing.Optional[app_commands.Choice[str]] = 
             pass
 
     guild_stickies.pop(ctx.channel.id, None)
+    save_settings(ctx.guild.id)
     await ctx.send("🧹 Sticky message removed from this channel.", ephemeral=True)
 
 
@@ -3021,7 +3374,7 @@ async def ping(ctx):
 
 # ---------- HIGHER OR LOWER (reposts a fresh embed each turn) ----------
 
-REPOST_THRESHOLD = 10  # only post a fresh game embed if this many messages have appeared since the last one
+REPOST_THRESHOLD = 10
 
 
 class HigherLowerView(discord.ui.View):
@@ -3439,49 +3792,11 @@ async def wordle(ctx):
     await ctx.send(embed=embed)
 
 
-# ---------- MENTION HANDLING ----------
-
-def get_uptime_string():
-    delta = datetime.datetime.now(datetime.timezone.utc) - BOT_START_TIME
-    days, remainder = divmod(int(delta.total_seconds()), 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes, _ = divmod(remainder, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
-
+# ---------- MENTION HANDLING (owner only now — everyone else uses /stats) ----------
 
 async def handle_mention(message):
     if message.author.id == OWNER_ID:
         await message.channel.send(random.choice(OWNER_REPLIES))
-        return
-
-    if message.guild and is_admin_or_owner(message.author):
-        active_count = sum(1 for gw in giveaways.values() if gw["active"] and gw["guild_id"] == message.guild.id)
-        embed = discord.Embed(
-            title="😎 ChillBot Status",
-            color=get_guild_color(message.guild.id)
-        )
-        embed.set_thumbnail(url=bot.user.display_avatar.url)
-        embed.add_field(name="Status", value="🟢 Online", inline=True)
-        embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-        embed.add_field(name="Uptime", value=get_uptime_string(), inline=True)
-        embed.add_field(name="Active giveaways here", value=str(active_count), inline=True)
-        embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
-        embed.add_field(name="Owner", value=OWNER_NAME, inline=True)
-        embed.set_footer(text="ChillBot 😎")
-        await message.channel.send(embed=embed)
-        return
-
-    embed = discord.Embed(
-        description="Hey there! 👋 Use **/help** to see what I can do.",
-        color=get_guild_color(message.guild.id) if message.guild else DEFAULT_COLOR
-    )
-    await message.channel.send(embed=embed)
 
 
 # ---------- MESSAGE HANDLING ----------
