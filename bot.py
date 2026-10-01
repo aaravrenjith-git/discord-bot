@@ -649,88 +649,52 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 # ---------- HELP COMMAND ----------
 
+HELP_DIVIDER = "───⋆❮ 𓆩 ❯⋆───"
+
+
 @bot.hybrid_command(name="help", description="Show all ChillBot commands and what they do")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def help_cmd(ctx):
+    sections = [
+        "**🎉 Giveaways** *(Admins or authorized roles)*\n"
+        "/start-giveaway · /end-giveaway · /cancel-giveaway\n"
+        "/edit-giveaway · /remove-participant",
+
+        "**💰 Economy & Shop**\n"
+        "/balance · /daily · /work · /shop\n"
+        "/trivia · /leaderboard",
+
+        "**🚔 Moderators**\n"
+        "/ban · /kick · /mute · /unmute\n"
+        "/warn · /warnings · /clearwarnings\n"
+        "/jail · /unjail · /userinfo · /avatar",
+
+        "**⚙️ Admin Only**\n"
+        "/setup · /staffsetup · /embed\n"
+        "/stick · /stopstick · /purge\n"
+        "/slowmode · /lock · /unlock",
+
+        "**🎮 Fun & Games**\n"
+        "/8ball · /roll · /meme · /coinflip\n"
+        "/game · /higher-lower · /minesweeper\n"
+        "/connect4 · /ping",
+
+        "**🌍 Anywhere** *(DMs, group chats, or servers)*\n"
+        "/wordle",
+
+        "**ℹ️ Everyone**\n"
+        "/serverinfo · /stats",
+    ]
+
+    description = f"\n\n{HELP_DIVIDER}\n\n".join(sections)
+
     embed = discord.Embed(
-        title="😎 ChillBot — Help",
-        description="Your all-in-one giveaway bot. Here's everything you can do:",
+        title="😎 ChillBot — Commands",
+        description=description,
         color=get_guild_color(ctx.guild.id) if ctx.guild else DEFAULT_COLOR
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(
-        name="🎉 Giveaway Commands (Admins or authorized roles)",
-        value=(
-            "**/start-giveaway** — Create a new giveaway (with a confirm step first)\n"
-            "**/end-giveaway** — End a giveaway early and pick winner(s)\n"
-            "**/cancel-giveaway** — Cancel a running giveaway without picking a winner\n"
-            "**/edit-giveaway** — Fix a mistake in a running giveaway\n"
-            "**/remove-participant** — Kick someone out of a giveaway\n"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="💰 Economy & Shop",
-        value=(
-            "**/balance** — Check how many coins you (or someone else) have\n"
-            "**/daily** — Claim a free reward every 24 hours (streaks pay more!)\n"
-            "**/work** — Do a mini-job to earn extra coins\n"
-            "**/shop** — Spend coins on boosts and power-ups\n"
-            "**/trivia** — Multiple-choice quiz for coins\n"
-            "**/leaderboard** — Server or global rankings"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🚔 Moderators",
-        value=(
-            "**/ban** / **/kick** — Remove a member from the server\n"
-            "**/mute** / **/unmute** — Timeout a member so they can't chat\n"
-            "**/warn** / **/warnings** — Log a warning or view someone's history\n"
-            "**/jail** / **/unjail** — Give a member the jailed role for a set time\n"
-            "**/userinfo** / **/avatar** — Look up a member's info or profile picture"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="⚙️ Admin Only",
-        value=(
-            "**/setup** — Configure host roles, blacklist, channels, ping role, jailed role, embed color, and log channel\n"
-            "**/staffsetup** — Configure who can use moderation commands, and the update log channel\n"
-            "**/embed** — Send a custom embed message\n"
-            "**/stick** / **/stopstick** — Stick or unstick a message at the bottom of a channel (max 5 per server)\n"
-            "**/purge** — Bulk delete recent messages\n"
-            "**/slowmode** — Set a channel's slowmode delay\n"
-            "**/lock** / **/unlock** — Stop or allow @everyone from sending messages here"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🎮 Fun & Games",
-        value=(
-            "**/8ball** — Ask the magic 8-ball a question\n"
-            "**/roll** — Roll dice, e.g. 2d20\n"
-            "**/meme** — Get a random meme\n"
-            "**/coinflip** — Flip a coin\n"
-            "**/game** — Play rock-paper-scissors vs ChillBot or a friend\n"
-            "**/higher-lower** — Guess if the next card is higher or lower\n"
-            "**/minesweeper** — Click cells, don't hit a bomb!\n"
-            "**/connect4** — Challenge a friend to Connect 4\n"
-            "**/ping** — Check ChillBot's latency"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="🌍 Anywhere (DMs, group chats, or servers)",
-        value="**/wordle** — Guess the 5-letter word in 6 tries",
-        inline=False
-    )
-    embed.add_field(
-        name="ℹ️ Everyone",
-        value="**/serverinfo** — Show info about this server",
-        inline=False
-    )
     embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
     await ctx.send(embed=embed)
 
