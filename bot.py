@@ -655,20 +655,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 # =====================================================================
-# HELP MENU (button-based category switcher)
+# HELP MENU (short overview + button-based category switcher)
 # =====================================================================
 
-HELP_DIVIDER = "───⋆❮ 𓆩 ❯⋆───"
-
-HELP_OVERVIEW_SECTIONS = [
-    "**🎉 Giveaways** *(Admins or authorized roles)*\n/start-giveaway · /end-giveaway · /cancel-giveaway\n/edit-giveaway · /remove-participant",
-    "**💰 Economy & Shop**\n/balance · /daily · /work · /shop\n/trivia · /leaderboard",
-    "**🚔 Moderators**\n/ban · /kick · /mute · /unmute\n/warn · /warnings · /clearwarnings\n/jail · /unjail · /userinfo · /avatar",
-    "**⚙️ Admin Only**\n/setup · /staffsetup · /embed\n/stick · /stopstick · /purge\n/slowmode · /lock · /unlock",
-    "**🎮 Fun & Games**\n/8ball · /roll · /meme · /coinflip\n/game · /higher-lower · /minesweeper\n/connect4 · /ping",
-    "**🌍 Anywhere** *(DMs, group chats, or servers)*\n/wordle",
-    "**ℹ️ Everyone**\n/serverinfo · /stats",
-]
+HELP_OVERVIEW_TEXT = (
+    "Hey! I'm **ChillBot** 😎, an all-in-one bot for your server.\n\n"
+    "🎉 Run giveaways\n"
+    "💰 Earn coins and spend them in the shop\n"
+    "🛡️ Moderate with bans, mutes, warnings and more\n"
+    "🎮 Play games like Wordle, Connect 4 and Minesweeper\n"
+    "ℹ️ Check server and bot info\n\n"
+    "**Tap a button below to see the commands in each category.**"
+)
 
 HELP_CATEGORIES = {
     "giveaways": {
@@ -736,7 +734,7 @@ HELP_CATEGORIES = {
             "**/higher-lower** — Guess if the next card is higher or lower.",
             "**/minesweeper** — Click cells; hitting a bomb ends the game.",
             "**/connect4** — Challenge a friend to Connect 4.",
-            "**/ping** — Check ChillBot's latency.",
+            "**/wordle** — Guess the 5-letter word in 6 tries (works in DMs too).",
         ],
     },
     "info": {
@@ -746,7 +744,7 @@ HELP_CATEGORIES = {
         "lines": [
             "**/serverinfo** — Show stats about this server.",
             "**/stats** — Show ChillBot's live status (uptime, latency, servers).",
-            "**/wordle** — Guess the 5-letter word in 6 tries (works in DMs too).",
+            "**/ping** — Check ChillBot's latency.",
         ],
     },
 }
@@ -760,10 +758,9 @@ class HelpView(discord.ui.View):
             self.add_item(HelpCategoryButton(key, info["label"]))
 
     def build_overview_embed(self):
-        description = f"\n\n{HELP_DIVIDER}\n\n".join(HELP_OVERVIEW_SECTIONS)
-        embed = discord.Embed(title="😎 ChillBot — Commands", description=description, color=self.guild_color)
+        embed = discord.Embed(title="😎 ChillBot", description=HELP_OVERVIEW_TEXT, color=self.guild_color)
         embed.set_thumbnail(url=bot.user.display_avatar.url)
-        embed.set_footer(text=f"Owner: {OWNER_NAME} • Tap a button below for details • ChillBot 😎")
+        embed.set_footer(text=f"Owner: {OWNER_NAME} • ChillBot 😎")
         return embed
 
     def build_category_embed(self, key):
@@ -3018,7 +3015,7 @@ class HigherLowerView(discord.ui.View):
 
     @staticmethod
     def card_label(card):
-        rank, suit = card
+        rank, suit = card[0], card[1]
         return f"{rank}{suit}"
 
     def build_embed(self, desc, color):
