@@ -63,6 +63,7 @@ meta_col = db["meta"]
 # ---------- DATA STORES (in memory, backed by MongoDB) ----------
 
 giveaways = {}
+giveaway_dirty = set()  # giveaway ids whose entries changed; flushed by the background loop
 authorized_roles = {}
 blacklisted_roles = {}
 entry_channels = {}
@@ -75,15 +76,32 @@ jail_roles = {}
 staff_roles = {}
 update_channels = {}
 sticky_messages = {}  # guild_id -> {channel_id: {"content": str, "message_id": int, "author_id": int}}
+automod_settings = {}  # guild_id -> automod config (see DEFAULT_AUTOMOD)
+automod_spam = {}  # (guild_id, user_id) -> [timestamps]
+
+DEFAULT_AUTOMOD = {
+    "enabled": False,
+    "words": [],
+    "block_invites": False,
+    "spam_limit": 0,      # messages allowed per AUTOMOD_SPAM_WINDOW seconds (0 = off)
+    "mention_limit": 0,   # max mentions in one message (0 = off)
+}
+AUTOMOD_SPAM_WINDOW = 5
+AUTOMOD_MAX_WORDS = 100
+AUTOMOD_TIMEOUT_EVERY = 3        # every Nth warning triggers a timeout
+AUTOMOD_TIMEOUT_MINUTES = 10
+INVITE_REGEX = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.IGNORECASE)
 
 # ---------- CHANGELOG (edit these two whenever you ship an update) ----------
-CURRENT_VERSION = "1.1"
+CURRENT_VERSION = "1.2"
 CHANGELOG_ENTRIES = [
-    "Added full moderation suite: /ban, /unban, /kick, /mute, /unmute, /warn, /warnings, /clearwarnings",
-    "Added /purge, /slowmode, /lock, /unlock, /userinfo, /serverinfo, /avatar",
-    "Added /stats (bot status is no longer shown on every ping — owner only now)",
-    "Sticky messages and warnings now survive restarts",
-    "Help menu redesigned with category buttons",
+    "Added AutoMod: banned words, invite blocking, spam and mass-mention limits (configure with /automod)",
+    "AutoMod violations are deleted, logged, and added to a member's warnings — repeat offenders get a timeout",
+    "Fixed a crash that could happen when a giveaway was cancelled while people were chatting",
+    "Giveaway entries are now saved in batches, so busy chats no longer hammer the database",
+    "/purge no longer times out on large deletions",
+    "Wordle guesses no longer stop your messages from counting as giveaway entries",
+    "Slash commands now sync once at startup instead of on every reconnect",
 ]
 
 economy = {}
@@ -91,6 +109,7 @@ economy_dirty = set()
 economy_loaded = False
 settings_loaded = False
 economy_tasks_started = False
+commands_synced = False
 jail_tasks = {}
 active_trivia = set()
 channel_msg_count = {}
@@ -115,7 +134,7 @@ async def save_giveaway(gid):
         "blacklist_role_id": gw["blacklist_role_id"],
         "bypass_role_id": gw["bypass_role_id"],
         "joined_users": list(gw["joined_users"]),
-        "entries": gw["entries"],
+        "entries": list(gw["entries"]),
         "active": gw["active"],
         "end_time": gw["end_time"].isoformat(),
     }
@@ -131,6 +150,8 @@ async def save_giveaway(gid):
 
 
 def delete_giveaway_doc(gid):
+    giveaway_dirty.discard(gid)
+
     def _delete():
         try:
             giveaways_col.delete_one({"_id": gid})
@@ -159,6 +180,7 @@ def save_settings(guild_id):
         "sticky_messages": {
             str(cid): sticky for cid, sticky in sticky_messages.get(guild_id, {}).items()
         },
+        "automod": automod_settings.get(guild_id),
     }
 
     def _write():
@@ -209,6 +231,11 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
             sticky_messages[guild_id] = {
                 int(cid): sticky for cid, sticky in doc["sticky_messages"].items()
             }
+        if doc.get("automod"):
+            cfg = dict(DEFAULT_AUTOMOD)
+            cfg.update(doc["automod"])
+            cfg["words"] = list(cfg.get("words", []))
+            automod_settings[guild_id] = cfg
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -367,7 +394,7 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
 
 
 LOGGED_COMMANDS = {
-    "setup", "staffsetup", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
+    "setup", "staffsetup", "automod", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
     "clearwarnings", "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
     "edit-giveaway", "remove-participant", "embed", "stick", "stopstick", "give-coins",
     "purge", "slowmode", "lock", "unlock",
@@ -399,7 +426,7 @@ async def log_command_usage(guild, user, channel, command_name):
 
 @bot.before_invoke
 async def global_command_logger(ctx):
-    """Fires before every hybrid/prefix command. /setup and /staffsetup are pure
+    """Fires before every hybrid/prefix command. /setup, /staffsetup and /automod are pure
     app_commands.Command objects and never pass through here, so they log themselves."""
     if ctx.guild and ctx.command:
         bot.loop.create_task(
@@ -564,14 +591,23 @@ class GiveawayView(discord.ui.View):
 # =====================================================================
 
 @bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}", flush=True)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for /start-giveaway 🎉"))
+async def setup_hook():
+    """Runs once at startup (not on reconnects), so commands are synced a single time."""
+    global commands_synced
+    if commands_synced:
+        return
+    commands_synced = True
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)", flush=True)
     except Exception as e:
         print(f"Slash command sync failed: {e}", flush=True)
+
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}", flush=True)
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for /start-giveaway 🎉"))
     try:
         settings_docs, giveaway_docs, user_docs = await asyncio.wait_for(asyncio.to_thread(fetch_all_data_sync), timeout=15)
         await apply_loaded_data(settings_docs, giveaway_docs)
@@ -662,7 +698,7 @@ HELP_OVERVIEW_TEXT = (
     "Hey! I'm **ChillBot** 😎, an all-in-one bot for your server.\n\n"
     "🎉 Run giveaways\n"
     "💰 Earn coins and spend them in the shop\n"
-    "🛡️ Moderate with bans, mutes, warnings and more\n"
+    "🛡️ Moderate with bans, mutes, warnings and AutoMod\n"
     "🎮 Play games like Wordle, Connect 4 and Minesweeper\n"
     "ℹ️ Check server and bot info\n\n"
     "**Tap a button below to see the commands in each category.**"
@@ -714,6 +750,7 @@ HELP_CATEGORIES = {
         "lines": [
             "**/setup** — Giveaway host roles, blacklist, entry channels, ping role, jailed role, embed color, log channel.",
             "**/staffsetup** — Who can use moderation commands, and the private update log channel.",
+            "**/automod** — Banned words, invite blocking, spam and mass-mention limits. Violations are deleted and logged as warnings.",
             "**/embed** — Post a custom embed message anywhere.",
             "**/stick** / **/stopstick** — Keep a message pinned at the bottom of a channel (max 5 per server).",
             "**/purge** — Bulk delete recent messages (optionally from one member).",
@@ -1189,6 +1226,7 @@ async def end_giveaway(giveaway_id):
     channel = bot.get_channel(gw["channel_id"])
     if channel is None:
         delete_giveaway_doc(giveaway_id)
+        giveaways.pop(giveaway_id, None)
         return
 
     if not gw["entries"]:
@@ -1204,6 +1242,7 @@ async def end_giveaway(giveaway_id):
         log_embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
         await send_log(channel.guild, log_embed)
         delete_giveaway_doc(giveaway_id)
+        giveaways.pop(giveaway_id, None)
         return
 
     pool = list(gw["entries"])
@@ -1233,6 +1272,8 @@ async def end_giveaway(giveaway_id):
     log_embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
     await send_log(channel.guild, log_embed)
     delete_giveaway_doc(giveaway_id)
+    # finished giveaways are dropped from memory so the dict (scanned on every message) stays small
+    giveaways.pop(giveaway_id, None)
 
 
 @bot.hybrid_command(name="end-giveaway", description="End a giveaway early and pick the winner(s) now")
@@ -1523,9 +1564,25 @@ def flush_economy_sync(batch):
         users_col.replace_one({"_id": doc["_id"]}, doc, upsert=True)
 
 
+async def flush_giveaways():
+    """Saves giveaways whose entries changed since the last flush (one write per giveaway,
+    no matter how many messages were sent)."""
+    if not giveaway_dirty:
+        return
+    ids = list(giveaway_dirty)
+    giveaway_dirty.clear()
+    for gid in ids:
+        await save_giveaway(gid)  # no-op if the giveaway has already ended/been removed
+
+
 async def economy_flush_loop():
     while True:
         await asyncio.sleep(15)
+        try:
+            await flush_giveaways()
+        except Exception as e:
+            print(f"Giveaway flush error: {e}", flush=True)
+
         if not economy_loaded or not economy_dirty:
             continue
         keys = list(economy_dirty)
@@ -2237,6 +2294,212 @@ async def staffsetup_cmd(interaction: discord.Interaction, action: app_commands.
 
 
 # =====================================================================
+# AUTOMOD (banned words, invites, spam, mass mentions)
+# =====================================================================
+
+def get_automod(guild_id):
+    """Returns this server's AutoMod config, creating it with defaults if needed."""
+    cfg = automod_settings.get(guild_id)
+    if cfg is None:
+        cfg = dict(DEFAULT_AUTOMOD)
+        cfg["words"] = []
+        automod_settings[guild_id] = cfg
+    return cfg
+
+
+def find_banned_word(content, words):
+    lowered = content.lower()
+    for word in words:
+        if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered):
+            return word
+    return None
+
+
+def check_automod_violation(message, cfg):
+    """Returns a short reason string if the message breaks a rule, otherwise None."""
+    if cfg["words"] and find_banned_word(message.content, cfg["words"]):
+        return "banned word"
+    if cfg["block_invites"] and INVITE_REGEX.search(message.content):
+        return "server invite link"
+    mention_limit = cfg["mention_limit"]
+    if mention_limit and (len(message.mentions) + len(message.role_mentions)) >= mention_limit:
+        return "too many mentions"
+    spam_limit = cfg["spam_limit"]
+    if spam_limit:
+        key = (message.guild.id, message.author.id)
+        now = time.time()
+        stamps = [t for t in automod_spam.get(key, []) if now - t < AUTOMOD_SPAM_WINDOW]
+        stamps.append(now)
+        if len(stamps) > spam_limit:
+            automod_spam[key] = []
+            return "spamming"
+        automod_spam[key] = stamps
+    return None
+
+
+async def run_automod(message):
+    """Returns True if the message was removed by AutoMod (caller should stop processing it)."""
+    cfg = automod_settings.get(message.guild.id)
+    if not cfg or not cfg.get("enabled"):
+        return False
+    member = message.author
+    if not isinstance(member, discord.Member) or can_moderate(member):
+        return False  # moderators and admins are exempt
+
+    reason = check_automod_violation(message, cfg)
+    if not reason:
+        return False
+
+    try:
+        await message.delete()
+    except Exception as e:
+        print(f"AutoMod delete failed: {e}", flush=True)
+
+    try:
+        await message.channel.send(f"{member.mention}, your message was removed by AutoMod ({reason}).", delete_after=6)
+    except Exception:
+        pass
+
+    u = get_user(message.guild.id, member.id)
+    warnings = u.setdefault("warnings", [])
+    warnings.append({"reason": f"AutoMod: {reason}", "mod_id": bot.user.id, "timestamp": time.time()})
+    if len(warnings) > 20:
+        u["warnings"] = warnings[-20:]
+    total = len(u["warnings"])
+    mark_dirty(message.guild.id, member.id)
+
+    timed_out = False
+    if total % AUTOMOD_TIMEOUT_EVERY == 0:
+        try:
+            until = discord.utils.utcnow() + datetime.timedelta(minutes=AUTOMOD_TIMEOUT_MINUTES)
+            await member.timeout(until, reason=f"AutoMod: {total} warnings")
+            timed_out = True
+        except Exception as e:
+            print(f"AutoMod timeout failed: {e}", flush=True)
+
+    log_embed = discord.Embed(
+        title="🤖 AutoMod Action",
+        description=f"{member.mention} in {message.channel.mention} — **{reason}**",
+        color=discord.Color.orange()
+    )
+    log_embed.add_field(name="Total warnings", value=str(total), inline=True)
+    if timed_out:
+        log_embed.add_field(name="Timeout", value=f"{AUTOMOD_TIMEOUT_MINUTES} minutes", inline=True)
+    await send_log(message.guild, log_embed)
+    return True
+
+
+@bot.tree.command(name="automod", description="[Admin] Configure automatic moderation (banned words, invites, spam, mentions)")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    action="Which setting do you want to change?",
+    word="The word or phrase to add/remove (for the banned word actions)",
+    number="A number for the spam / mention limit (0 turns that rule off)"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="✅ Turn AutoMod on", value="enable"),
+    app_commands.Choice(name="⛔ Turn AutoMod off", value="disable"),
+    app_commands.Choice(name="➕ Add a banned word", value="add_word"),
+    app_commands.Choice(name="➖ Remove a banned word", value="remove_word"),
+    app_commands.Choice(name="🔗 Toggle invite link blocking", value="toggle_invites"),
+    app_commands.Choice(name="💬 Set spam limit (messages per 5 seconds)", value="set_spam"),
+    app_commands.Choice(name="📣 Set mention limit (mentions per message)", value="set_mentions"),
+    app_commands.Choice(name="📋 Show AutoMod settings", value="show"),
+])
+async def automod_cmd(interaction: discord.Interaction, action: app_commands.Choice[str], word: typing.Optional[str] = None, number: typing.Optional[int] = None):
+    if not is_admin_or_owner(interaction.user):
+        await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
+        return
+    bot.loop.create_task(log_command_usage(interaction.guild, interaction.user, interaction.channel, "automod"))
+
+    guild_id = interaction.guild.id
+    act = action.value
+    cfg = get_automod(guild_id)
+
+    if act in ("add_word", "remove_word") and not word:
+        await interaction.response.send_message("Please type the word or phrase in the `word` option.", ephemeral=True)
+        return
+    if act in ("set_spam", "set_mentions") and number is None:
+        await interaction.response.send_message("Please provide a number in the `number` option (0 turns the rule off).", ephemeral=True)
+        return
+
+    if act == "enable":
+        cfg["enabled"] = True
+        save_settings(guild_id)
+        await interaction.response.send_message(
+            "✅ AutoMod is **on**. Moderators and admins are exempt.\n"
+            "💡 Make sure I have **Manage Messages** (to delete) and **Moderate Members** (for timeouts), and set a log channel with **/setup** to see actions.",
+            ephemeral=True
+        )
+    elif act == "disable":
+        cfg["enabled"] = False
+        save_settings(guild_id)
+        await interaction.response.send_message("⛔ AutoMod is **off**. Your settings are kept.", ephemeral=True)
+    elif act == "add_word":
+        cleaned = word.strip().lower()
+        if not cleaned or len(cleaned) > 50:
+            await interaction.response.send_message("Words must be 1-50 characters long.", ephemeral=True)
+            return
+        if cleaned in cfg["words"]:
+            await interaction.response.send_message("That word is already banned.", ephemeral=True)
+            return
+        if len(cfg["words"]) >= AUTOMOD_MAX_WORDS:
+            await interaction.response.send_message(f"You've hit the limit of {AUTOMOD_MAX_WORDS} banned words.", ephemeral=True)
+            return
+        cfg["words"].append(cleaned)
+        save_settings(guild_id)
+        await interaction.response.send_message(f"✅ Added to the banned word list ({len(cfg['words'])}/{AUTOMOD_MAX_WORDS}).", ephemeral=True)
+    elif act == "remove_word":
+        cleaned = word.strip().lower()
+        if cleaned not in cfg["words"]:
+            await interaction.response.send_message("That word isn't on the banned list.", ephemeral=True)
+            return
+        cfg["words"].remove(cleaned)
+        save_settings(guild_id)
+        await interaction.response.send_message("❌ Removed from the banned word list.", ephemeral=True)
+    elif act == "toggle_invites":
+        cfg["block_invites"] = not cfg["block_invites"]
+        save_settings(guild_id)
+        await interaction.response.send_message(f"🔗 Invite link blocking is now **{'on' if cfg['block_invites'] else 'off'}**.", ephemeral=True)
+    elif act == "set_spam":
+        if number < 0 or number > 20:
+            await interaction.response.send_message("Spam limit must be between 0 and 20.", ephemeral=True)
+            return
+        if 0 < number < 3:
+            await interaction.response.send_message("A spam limit below 3 would catch normal chatting — use 3 or more (or 0 to turn it off).", ephemeral=True)
+            return
+        cfg["spam_limit"] = number
+        save_settings(guild_id)
+        msg = "💬 Spam filter turned **off**." if number == 0 else f"💬 Members sending more than **{number}** messages in {AUTOMOD_SPAM_WINDOW} seconds will be actioned."
+        await interaction.response.send_message(msg, ephemeral=True)
+    elif act == "set_mentions":
+        if number < 0 or number > 50:
+            await interaction.response.send_message("Mention limit must be between 0 and 50.", ephemeral=True)
+            return
+        if number == 1:
+            await interaction.response.send_message("A limit of 1 would block every reply that pings someone — use 2 or more (or 0 to turn it off).", ephemeral=True)
+            return
+        cfg["mention_limit"] = number
+        save_settings(guild_id)
+        msg = "📣 Mention filter turned **off**." if number == 0 else f"📣 Messages with **{number}** or more mentions will be removed."
+        await interaction.response.send_message(msg, ephemeral=True)
+    elif act == "show":
+        embed = discord.Embed(title="🤖 AutoMod Settings", color=get_guild_color(guild_id))
+        embed.add_field(name="Status", value="🟢 On" if cfg["enabled"] else "🔴 Off", inline=True)
+        embed.add_field(name="Invite blocking", value="On" if cfg["block_invites"] else "Off", inline=True)
+        embed.add_field(name="Spam limit", value=f"{cfg['spam_limit']} per {AUTOMOD_SPAM_WINDOW}s" if cfg["spam_limit"] else "Off", inline=True)
+        embed.add_field(name="Mention limit", value=str(cfg["mention_limit"]) if cfg["mention_limit"] else "Off", inline=True)
+        words_text = ", ".join(f"||{w}||" for w in cfg["words"]) or "None"
+        if len(words_text) > 1000:
+            words_text = words_text[:1000] + "..."
+        embed.add_field(name=f"Banned words ({len(cfg['words'])})", value=words_text, inline=False)
+        embed.set_footer(text=f"Every {AUTOMOD_TIMEOUT_EVERY}rd warning = {AUTOMOD_TIMEOUT_MINUTES}m timeout • Mods/admins exempt • ChillBot 😎")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# =====================================================================
 # MODERATION: BAN, KICK, MUTE, WARN
 # =====================================================================
 
@@ -2530,6 +2793,9 @@ async def purge_cmd(ctx, amount: int, member: typing.Optional[discord.Member] = 
     if amount < 1 or amount > 100:
         await ctx.send("Amount must be between 1 and 100.", ephemeral=True)
         return
+
+    # purging can take longer than Discord's 3-second slash command window, so acknowledge first
+    await ctx.defer(ephemeral=True)
 
     def check(m):
         return member is None or m.author.id == member.id
@@ -3383,6 +3649,39 @@ async def handle_mention(message):
 # MESSAGE HANDLING
 # =====================================================================
 
+async def handle_wordle_guess(message):
+    """Processes a Wordle guess if this user has a game running. Doesn't stop the rest of
+    on_message, so guesses still count toward giveaways, stickies, etc."""
+    state = wordle_games.get(message.author.id)
+    if not state or state["over"]:
+        return
+    content = message.content.strip().lower()
+    if len(content) != 5 or not content.isalpha():
+        return
+
+    feedback = wordle_feedback(content, state["word"])
+    state["guesses"].append((content, feedback))
+    board_text = "\n".join(f"{' '.join(fb)}\n{' '.join(g.upper())}" for g, fb in state["guesses"])
+
+    if content == state["word"]:
+        state["over"] = True
+        embed = discord.Embed(
+            title="🟩 Wordle — You Won!",
+            description=f"{board_text}\n\n🎉 You guessed it in {len(state['guesses'])}/6 tries!",
+            color=discord.Color.green()
+        )
+    elif len(state["guesses"]) >= 6:
+        state["over"] = True
+        embed = discord.Embed(
+            title="🟩 Wordle — Out of Tries",
+            description=f"{board_text}\n\nThe word was **{state['word'].upper()}**. Try `/wordle` again!",
+            color=discord.Color.red()
+        )
+    else:
+        embed = discord.Embed(title=f"🟩 Wordle — Guess {len(state['guesses'])}/6", description=board_text, color=DEFAULT_COLOR)
+    await message.channel.send(embed=embed)
+
+
 @bot.event
 async def on_message(message):
     try:
@@ -3391,41 +3690,19 @@ async def on_message(message):
 
         channel_msg_count[message.channel.id] = channel_msg_count.get(message.channel.id, 0) + 1
 
+        # AutoMod runs first — a removed message shouldn't earn giveaway entries or trigger anything else
+        if message.guild and await run_automod(message):
+            return
+
         if bot.user in message.mentions:
             await handle_mention(message)
             return
 
-        if message.author.id in wordle_games and not wordle_games[message.author.id]["over"]:
-            content = message.content.strip().lower()
-            if len(content) == 5 and content.isalpha():
-                game_state = wordle_games[message.author.id]
-                feedback = wordle_feedback(content, game_state["word"])
-                game_state["guesses"].append((content, feedback))
-                board_text = "\n".join(f"{' '.join(fb)}\n{' '.join(g.upper())}" for g, fb in game_state["guesses"])
-
-                if content == game_state["word"]:
-                    game_state["over"] = True
-                    embed = discord.Embed(
-                        title="🟩 Wordle — You Won!",
-                        description=f"{board_text}\n\n🎉 You guessed it in {len(game_state['guesses'])}/6 tries!",
-                        color=discord.Color.green()
-                    )
-                    await message.channel.send(embed=embed)
-                elif len(game_state["guesses"]) >= 6:
-                    game_state["over"] = True
-                    embed = discord.Embed(
-                        title="🟩 Wordle — Out of Tries",
-                        description=f"{board_text}\n\nThe word was **{game_state['word'].upper()}**. Try `/wordle` again!",
-                        color=discord.Color.red()
-                    )
-                    await message.channel.send(embed=embed)
-                else:
-                    embed = discord.Embed(title=f"🟩 Wordle — Guess {len(game_state['guesses'])}/6", description=board_text, color=DEFAULT_COLOR)
-                    await message.channel.send(embed=embed)
-                return
+        await handle_wordle_guess(message)
 
         if message.guild:
-            for gid, gw in giveaways.items():
+            # list(...) snapshot: giveaways can be ended/cancelled while we iterate
+            for gid, gw in list(giveaways.items()):
                 if not gw["active"] or gw["guild_id"] != message.guild.id:
                     continue
                 if message.author.id not in gw["joined_users"]:
@@ -3435,7 +3712,7 @@ async def on_message(message):
                 mult = get_multiplier(message.guild.id, message.author)
                 for _ in range(mult):
                     gw["entries"].append(message.author.id)
-                await save_giveaway(gid)
+                giveaway_dirty.add(gid)  # saved in a batch by the flush loop instead of once per message
 
             guild_stickies = sticky_messages.get(message.guild.id)
             if guild_stickies and message.channel.id in guild_stickies:
