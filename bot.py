@@ -93,8 +93,9 @@ AUTOMOD_TIMEOUT_MINUTES = 10
 INVITE_REGEX = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.IGNORECASE)
 
 # ---------- CHANGELOG (edit these two whenever you ship an update) ----------
-CURRENT_VERSION = "1.2"
+CURRENT_VERSION = "1.3"
 CHANGELOG_ENTRIES = [
+    "Added /sendnote: moderators can DM a member a note (shows who sent it) without giving a warning",
     "Added AutoMod: banned words, invite blocking, spam and mass-mention limits (configure with /automod)",
     "AutoMod violations are deleted, logged, and added to a member's warnings — repeat offenders get a timeout",
     "Fixed a crash that could happen when a giveaway was cancelled while people were chatting",
@@ -395,7 +396,7 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
 
 LOGGED_COMMANDS = {
     "setup", "staffsetup", "automod", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
-    "clearwarnings", "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
+    "clearwarnings", "sendnote", "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
     "edit-giveaway", "remove-participant", "embed", "stick", "stopstick", "give-coins",
     "purge", "slowmode", "lock", "unlock",
 }
@@ -739,6 +740,7 @@ HELP_CATEGORIES = {
             "**/kick** — Remove a member from the server.",
             "**/mute** / **/unmute** — Timeout a member so they can't chat or speak.",
             "**/warn** / **/warnings** / **/clearwarnings** — Log, view, or clear a member's warning history.",
+            "**/sendnote** — DM a member a message from the mods (shows who sent it). Not a warning, nothing is recorded.",
             "**/jail** / **/unjail** — Apply or remove this server's jailed role for a set time.",
             "**/userinfo** / **/avatar** — Look up a member's details or profile picture.",
         ],
@@ -2729,6 +2731,59 @@ async def warn_cmd(ctx, member: discord.Member, reason: str):
     log_embed = discord.Embed(title="⚠️ Member Warned", description=f"{member.mention} warned by {ctx.author.mention}", color=discord.Color.gold())
     log_embed.add_field(name="Reason", value=reason, inline=False)
     log_embed.add_field(name="Total warnings", value=str(len(u["warnings"])), inline=False)
+    await send_log(ctx.guild, log_embed)
+
+
+@bot.hybrid_command(name="sendnote", description="DM a member a note from the mods (not a warning, nothing is recorded)")
+@app_commands.default_permissions(moderate_members=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to send the note to", message="What you want to tell them")
+async def sendnote_cmd(ctx, member: discord.Member, *, message: str):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_moderate(ctx.author):
+        await ctx.send("You don't have permission to use moderation commands.", ephemeral=True)
+        return
+    if member.bot:
+        await ctx.send("You can't send a note to a bot 🤖", ephemeral=True)
+        return
+    if member.id == ctx.author.id:
+        await ctx.send("You can't send a note to yourself!", ephemeral=True)
+        return
+    if len(message) > 1500:
+        await ctx.send("Note is too long (max 1500 characters).", ephemeral=True)
+        return
+
+    dm_embed = discord.Embed(
+        title=f"📩 A note from the {ctx.guild.name} moderators",
+        description=message,
+        color=get_guild_color(ctx.guild.id)
+    )
+    dm_embed.add_field(name="Sent by", value=f"{ctx.author.mention} ({ctx.author})", inline=False)
+    dm_embed.set_footer(text="This is a note, not a warning • ChillBot 😎")
+    if ctx.guild.icon:
+        dm_embed.set_thumbnail(url=ctx.guild.icon.url)
+
+    try:
+        await member.send(embed=dm_embed)
+    except discord.Forbidden:
+        await ctx.send(f"❌ I couldn't DM {member.mention} — they have DMs from server members turned off.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"Send note error: {e}", flush=True)
+        await ctx.send("Something went wrong sending that note, try again.", ephemeral=True)
+        return
+
+    await ctx.send(f"✅ Note sent to {member.mention}. It was not added to their warnings.", ephemeral=True)
+
+    log_embed = discord.Embed(
+        title="📩 Note Sent",
+        description=f"{ctx.author.mention} sent a note to {member.mention}",
+        color=discord.Color.blurple()
+    )
+    log_embed.add_field(name="Message", value=message[:1000], inline=False)
     await send_log(ctx.guild, log_embed)
 
 
