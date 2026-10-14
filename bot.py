@@ -93,8 +93,10 @@ AUTOMOD_TIMEOUT_MINUTES = 10
 INVITE_REGEX = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.IGNORECASE)
 
 # ---------- CHANGELOG (edit these two whenever you ship an update) ----------
-CURRENT_VERSION = "1.3"
+CURRENT_VERSION = "1.4"
 CHANGELOG_ENTRIES = [
+    "Added /autosetup: creates the jailed role (hidden from every channel) and a private logs channel in one step",
+    "Updates now ping @everyone in a private update channel so admins notice them",
     "Added /sendnote: moderators can DM a member a note (shows who sent it) without giving a warning",
     "Added AutoMod: banned words, invite blocking, spam and mass-mention limits (configure with /automod)",
     "AutoMod violations are deleted, logged, and added to a member's warnings — repeat offenders get a timeout",
@@ -395,7 +397,7 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
 
 
 LOGGED_COMMANDS = {
-    "setup", "staffsetup", "automod", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
+    "setup", "staffsetup", "autosetup", "automod", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
     "clearwarnings", "sendnote", "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
     "edit-giveaway", "remove-participant", "embed", "stick", "stopstick", "give-coins",
     "purge", "slowmode", "lock", "unlock",
@@ -654,7 +656,13 @@ async def post_changelog_if_new_version():
         channel = guild.get_channel(channel_id)
         if channel:
             try:
-                await channel.send(embed=embed)
+                # @everyone only pings members who can see the channel, so it's safe in a private
+                # staff channel — but if the update channel is public, don't ping the whole server
+                is_private = channel.permissions_for(guild.default_role).view_channel is False
+                if is_private:
+                    await channel.send(content="@everyone", embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
+                else:
+                    await channel.send(embed=embed)
             except Exception as e:
                 print(f"Failed to post changelog in guild {guild_id}: {e}", flush=True)
 
@@ -751,7 +759,8 @@ HELP_CATEGORIES = {
         "note": "Requires Administrator unless noted.",
         "lines": [
             "**/setup** — Giveaway host roles, blacklist, entry channels, ping role, jailed role, embed color, log channel.",
-            "**/staffsetup** — Who can use moderation commands, and the private update log channel.",
+            "**/autosetup** — One-click setup: creates the jailed role (hidden from every channel) and a private logs/updates channel.",
+            "**/staffsetup** —Who can use moderation commands, and the private update log channel.",
             "**/automod** — Banned words, invite blocking, spam and mass-mention limits. Violations are deleted and logged as warnings.",
             "**/embed** — Post a custom embed message anywhere.",
             "**/stick** / **/stopstick** — Keep a message pinned at the bottom of a channel (max 5 per server).",
@@ -2228,6 +2237,141 @@ async def unjail_cmd(ctx, member: discord.Member):
         return
     await release_jail(ctx.guild.id, member.id, released_by=ctx.author)
     await ctx.send(embed=discord.Embed(title="🔓 Released", description=f"{member.mention} was let out of jail by {ctx.author.mention}.", color=discord.Color.green()))
+
+
+# =====================================================================
+# AUTO SETUP (jailed role + private logs channel in one command)
+# =====================================================================
+
+JAIL_OVERWRITE = discord.PermissionOverwrite(
+    view_channel=False, send_messages=False, add_reactions=False, connect=False, speak=False
+)
+
+
+async def apply_jail_lockdown(guild: discord.Guild, role: discord.Role):
+    """Hides every channel from the jailed role. Returns (done, failed) counts."""
+    done = failed = 0
+    for ch in guild.channels:
+        try:
+            await ch.set_permissions(role, overwrite=JAIL_OVERWRITE, reason="ChillBot /autosetup: jailed role lockdown")
+            done += 1
+        except Exception as e:
+            failed += 1
+            print(f"Jail lockdown failed on #{ch.name}: {e}", flush=True)
+    return done, failed
+
+
+async def jail_lockdown_new_channel(channel):
+    """Channels created after setup are hidden from the jailed role automatically."""
+    try:
+        role_id = jail_roles.get(channel.guild.id)
+        role = channel.guild.get_role(role_id) if role_id else None
+        if role:
+            await channel.set_permissions(role, overwrite=JAIL_OVERWRITE, reason="ChillBot: hiding new channel from jailed role")
+    except Exception as e:
+        print(f"Jail lockdown (new channel) error: {e}", flush=True)
+
+
+@bot.tree.command(name="autosetup", description="[Admin] Automatically create the jailed role and a private logs channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+async def autosetup_cmd(interaction: discord.Interaction):
+    if not is_admin_or_owner(interaction.user):
+        await interaction.response.send_message("This command is for Administrators only.", ephemeral=True)
+        return
+    guild = interaction.guild
+    me = guild.me
+    if not (me.guild_permissions.manage_roles and me.guild_permissions.manage_channels):
+        await interaction.response.send_message(
+            "I need **Manage Roles** and **Manage Channels** to do this. Give me those permissions (or Administrator) and run `/autosetup` again.",
+            ephemeral=True
+        )
+        return
+
+    bot.loop.create_task(log_command_usage(guild, interaction.user, interaction.channel, "autosetup"))
+    await interaction.response.defer(ephemeral=True)
+    guild_id = guild.id
+    report = []
+
+    # 1) Jailed role — reuse the configured one if it still exists
+    role = guild.get_role(jail_roles[guild_id]) if guild_id in jail_roles else None
+    try:
+        if role is None:
+            role = await guild.create_role(
+                name="Jailed", permissions=discord.Permissions.none(),
+                color=discord.Color.dark_grey(), reason=f"/autosetup by {interaction.user}"
+            )
+            report.append(f"🔒 Created the {role.mention} role.")
+        else:
+            report.append(f"🔒 Using your existing jailed role {role.mention}.")
+    except discord.Forbidden:
+        await interaction.followup.send("I couldn't create the role. Check that I have **Manage Roles**.", ephemeral=True)
+        return
+    jail_roles[guild_id] = role.id
+
+    if role.managed or role >= me.top_role:
+        report.append("⚠️ I can't hand out that role yet — in Server Settings → Roles, drag my role above it.")
+
+    # 2) Hide every channel from the jailed role
+    done, failed = await apply_jail_lockdown(guild, role)
+    report.append(f"🙈 Hidden from jailed members: **{done}** channel(s)." + (f" ⚠️ {failed} failed (I may lack access to them)." if failed else ""))
+
+    # 3) Private logs channel — only admins, staff roles and the bot can see it
+    log_ch = guild.get_channel(log_channels[guild_id]) if guild_id in log_channels else None
+    try:
+        if log_ch is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                me: discord.PermissionOverwrite(view_channel=True, send_messages=True, embed_links=True, mention_everyone=True),
+                role: JAIL_OVERWRITE,
+            }
+            for rid in staff_roles.get(guild_id, set()):
+                staff_role = guild.get_role(rid)
+                if staff_role:
+                    overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True)
+            log_ch = await guild.create_text_channel(
+                "chillbot-logs", overwrites=overwrites,
+                topic="Private ChillBot logs and update announcements — staff only.",
+                reason=f"/autosetup by {interaction.user}"
+            )
+            report.append(f"📝 Created the private {log_ch.mention} channel.")
+        else:
+            try:
+                await log_ch.set_permissions(me, view_channel=True, send_messages=True, embed_links=True, mention_everyone=True)
+            except Exception:
+                pass
+            report.append(f"📝 Using your existing log channel {log_ch.mention}.")
+    except discord.Forbidden:
+        await interaction.followup.send("I couldn't create the logs channel. Check that I have **Manage Channels**.", ephemeral=True)
+        save_settings(guild_id)
+        return
+
+    log_channels[guild_id] = log_ch.id
+    update_channels[guild_id] = log_ch.id
+    save_settings(guild_id)
+    report.append("📣 Logs and ChillBot updates both go there. Updates ping @everyone, which only reaches people who can see the channel.")
+
+    embed = discord.Embed(title="✅ Auto setup complete", description="\n".join(report), color=discord.Color.green())
+    embed.add_field(
+        name="Next steps",
+        value=(
+            "• Add your moderator roles with **/staffsetup** so they can see the logs channel.\n"
+            "• New channels you create later are hidden from jailed members automatically.\n"
+            "• Test it with **/jail** on a spare account."
+        ),
+        inline=False
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    try:
+        await log_ch.send(embed=discord.Embed(
+            title="👋 ChillBot logs are live",
+            description="Moderation logs, AutoMod actions and ChillBot update announcements will appear here.",
+            color=discord.Color.blurple()
+        ))
+    except Exception as e:
+        print(f"Autosetup welcome message failed: {e}", flush=True)
 
 
 # =====================================================================
@@ -3779,5 +3923,6 @@ async def on_message(message):
 
 
 bot.add_listener(economy_on_member_join, "on_member_join")
+bot.add_listener(jail_lockdown_new_channel, "on_guild_channel_create")
 
 bot.run(os.environ["DISCORD_TOKEN"])
