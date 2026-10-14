@@ -3925,4 +3925,25 @@ async def on_message(message):
 bot.add_listener(economy_on_member_join, "on_member_join")
 bot.add_listener(jail_lockdown_new_channel, "on_guild_channel_create")
 
-bot.run(os.environ["DISCORD_TOKEN"])
+
+def start_bot():
+    """If Discord/Cloudflare rate-limits this host (error 1015 / HTTP 429), crashing makes Render
+    restart us immediately, and every restart is another login attempt that extends the ban.
+    Instead we wait quietly (the Flask server keeps the service 'healthy'), then restart fresh."""
+    import sys
+    delay = int(os.environ.get("CHILLBOT_BACKOFF", "0") or 0)
+    if delay:
+        print(f"Waiting {delay}s before logging in (previous login was rate limited)...", flush=True)
+        time.sleep(delay)
+    try:
+        bot.run(os.environ["DISCORD_TOKEN"])
+    except discord.HTTPException as e:
+        if e.status != 429:
+            raise
+        next_delay = min(max(delay * 2, 900), 3600)  # 15 min, then 30, then 60 (max)
+        print(f"Discord rate limited this host (HTTP 429 / Cloudflare 1015). Retrying in {next_delay // 60} min.", flush=True)
+        os.environ["CHILLBOT_BACKOFF"] = str(next_delay)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+start_bot()
