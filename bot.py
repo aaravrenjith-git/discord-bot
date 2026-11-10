@@ -1,4 +1,6 @@
 import os
+import io
+import uuid
 import random
 import asyncio
 import discord
@@ -59,6 +61,10 @@ giveaways_col = db["giveaways"]
 settings_col = db["settings"]
 users_col = db["users"]
 meta_col = db["meta"]
+ended_col = db["ended_giveaways"]
+polls_col = db["polls"]
+suggestions_col = db["suggestions"]
+reminders_col = db["reminders"]
 
 # ---------- DATA STORES (in memory, backed by MongoDB) ----------
 
@@ -77,6 +83,8 @@ staff_roles = {}
 update_channels = {}
 sticky_messages = {}  # guild_id -> {channel_id: {"content": str, "message_id": int, "author_id": int}}
 automod_settings = {}  # guild_id -> automod config (see DEFAULT_AUTOMOD)
+shop_roles = {}  # guild_id -> {role_id: price}
+auto_channels = {}  # guild_id -> {channel_id: {"mode": "thread"|"delete", "seconds": int}}
 automod_spam = {}  # (guild_id, user_id) -> [timestamps]
 
 DEFAULT_AUTOMOD = {
@@ -93,18 +101,13 @@ AUTOMOD_TIMEOUT_MINUTES = 10
 INVITE_REGEX = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/\S+", re.IGNORECASE)
 
 # ---------- CHANGELOG (edit these two whenever you ship an update) ----------
-CURRENT_VERSION = "1.4"
+CURRENT_VERSION = "1.5"
 CHANGELOG_ENTRIES = [
-    "Added /autosetup: creates the jailed role (hidden from every channel) and a private logs channel in one step",
-    "Updates now ping @everyone in a private update channel so admins notice them",
-    "Added /sendnote: moderators can DM a member a note (shows who sent it) without giving a warning",
-    "Added AutoMod: banned words, invite blocking, spam and mass-mention limits (configure with /automod)",
-    "AutoMod violations are deleted, logged, and added to a member's warnings — repeat offenders get a timeout",
-    "Fixed a crash that could happen when a giveaway was cancelled while people were chatting",
-    "Giveaway entries are now saved in batches, so busy chats no longer hammer the database",
-    "/purge no longer times out on large deletions",
-    "Wordle guesses no longer stop your messages from counting as giveaway entries",
-    "Slash commands now sync once at startup instead of on every reconnect",
+    "Added /reroll to pick a new giveaway winner (works for giveaways ended in the last 30 days)",
+    "Added /poll with live results, /suggest with vote buttons and /remind personal reminders",
+    "Added tickets (/ticketsetup) with private channels and saved transcripts",
+    "Added /rolemenu dropdown self-roles and /autochannel (auto-thread / auto-delete)",
+    "Economy: new /pay, /blackjack and /rob, plus cosmetic roles for sale in /shop (/shoprole)",
 ]
 
 economy = {}
@@ -184,6 +187,8 @@ def save_settings(guild_id):
             str(cid): sticky for cid, sticky in sticky_messages.get(guild_id, {}).items()
         },
         "automod": automod_settings.get(guild_id),
+        "shop_roles": {str(k): v for k, v in shop_roles.get(guild_id, {}).items()},
+        "auto_channels": {str(k): v for k, v in auto_channels.get(guild_id, {}).items()},
     }
 
     def _write():
@@ -239,6 +244,8 @@ async def apply_loaded_data(settings_docs, giveaway_docs):
             cfg.update(doc["automod"])
             cfg["words"] = list(cfg.get("words", []))
             automod_settings[guild_id] = cfg
+        shop_roles[guild_id] = {int(k): v for k, v in doc.get("shop_roles", {}).items()}
+        auto_channels[guild_id] = {int(k): v for k, v in doc.get("auto_channels", {}).items()}
     print(f"Loaded settings for {len(settings_docs)} server(s) from database.", flush=True)
 
     for doc in giveaway_docs:
@@ -397,7 +404,7 @@ async def send_log(guild: discord.Guild, embed: discord.Embed):
 
 
 LOGGED_COMMANDS = {
-    "setup", "staffsetup", "autosetup", "automod", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
+    "setup", "staffsetup", "autosetup", "automod", "reroll", "ticketsetup", "rolemenu", "shoprole", "autochannel", "ban", "unban", "kick", "mute", "unmute", "warn", "warnings",
     "clearwarnings", "sendnote", "jail", "unjail", "start-giveaway", "end-giveaway", "cancel-giveaway",
     "edit-giveaway", "remove-participant", "embed", "stick", "stopstick", "give-coins",
     "purge", "slowmode", "lock", "unlock",
@@ -600,6 +607,12 @@ async def setup_hook():
     if commands_synced:
         return
     commands_synced = True
+    # buttons/menus on old messages keep working after a restart
+    bot.add_view(PollView())
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketCloseView())
+    bot.add_view(RoleMenuView())
+    bot.add_view(SuggestionView())
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)", flush=True)
@@ -615,11 +628,13 @@ async def on_ready():
         settings_docs, giveaway_docs, user_docs = await asyncio.wait_for(asyncio.to_thread(fetch_all_data_sync), timeout=15)
         await apply_loaded_data(settings_docs, giveaway_docs)
         await apply_user_data(user_docs)
+        await load_v15_data()
     except asyncio.TimeoutError:
         print("Loading data from database timed out — continuing without it. Check MONGODB_URI / Atlas network access.", flush=True)
     except Exception as e:
         print(f"load_all_data error: {e}", flush=True)
     start_economy_tasks()
+    start_v15_tasks()
     await post_changelog_if_new_version()
 
 
@@ -708,7 +723,8 @@ HELP_OVERVIEW_TEXT = (
     "🎉 Run giveaways\n"
     "💰 Earn coins and spend them in the shop\n"
     "🛡️ Moderate with bans, mutes, warnings and AutoMod\n"
-    "🎮 Play games like Wordle, Connect 4 and Minesweeper\n"
+    "🎮 Play games like Wordle, Connect 4, Minesweeper and Blackjack\n"
+    "🎫 Tickets, polls, role menus and suggestions\n"
     "ℹ️ Check server and bot info\n\n"
     "**Tap a button below to see the commands in each category.**"
 )
@@ -724,6 +740,7 @@ HELP_CATEGORIES = {
             "**/cancel-giveaway** — Cancel a giveaway with no winner picked.",
             "**/edit-giveaway** — Change the prize, remaining time, or winner count on a running giveaway.",
             "**/remove-participant** — Remove one person's entries from a giveaway.",
+            "**/reroll** — Pick a new winner for a giveaway that already ended (works for 30 days).",
         ],
     },
     "economy": {
@@ -734,7 +751,10 @@ HELP_CATEGORIES = {
             "**/balance** — Check your (or someone else's) coins and daily status.",
             "**/daily** — Claim a free reward every 24 hours. Keeping a streak pays more.",
             "**/work** — Do a quick job for coins, once per hour.",
-            "**/shop** — Spend coins on temporary 2x/3x coin boosts.",
+            "**/shop** — Spend coins on 2x/3x boosts and cosmetic roles.",
+            "**/pay** — Send some of your coins to another member.",
+            "**/blackjack** — Bet coins against the dealer (hit, stand or double down).",
+            "**/rob** — Try to steal coins from someone. Risky: get caught and you pay a fine, maybe even jail.",
             "**/trivia** — Run a 1-10 question quiz; points become coins.",
             "**/leaderboard** — Rank by coins, trivia points, or giveaway wins — per server or globally.",
         ],
@@ -760,13 +780,27 @@ HELP_CATEGORIES = {
         "lines": [
             "**/setup** — Giveaway host roles, blacklist, entry channels, ping role, jailed role, embed color, log channel.",
             "**/autosetup** — One-click setup: creates the jailed role (hidden from every channel) and a private logs/updates channel.",
-            "**/staffsetup** —Who can use moderation commands, and the private update log channel.",
+            "**/staffsetup** — Who can use moderation commands, and the private update log channel.",
             "**/automod** — Banned words, invite blocking, spam and mass-mention limits. Violations are deleted and logged as warnings.",
+            "**/ticketsetup** — Post a panel with an 'Open a ticket' button. Tickets are private and saved as a transcript.",
+            "**/rolemenu** — Post a dropdown menu so members can pick their own roles.",
+            "**/shoprole** — Sell cosmetic roles in /shop for coins.",
+            "**/autochannel** — Auto-thread every message in a channel, or auto-delete messages after a delay.",
             "**/embed** — Post a custom embed message anywhere.",
             "**/stick** / **/stopstick** — Keep a message pinned at the bottom of a channel (max 5 per server).",
             "**/purge** — Bulk delete recent messages (optionally from one member).",
             "**/slowmode** — Set a channel's slowmode delay.",
             "**/lock** / **/unlock** — Stop or allow @everyone from sending messages in a channel.",
+        ],
+    },
+    "utility": {
+        "label": "🧰 Utility",
+        "title": "🧰 Utility Commands",
+        "note": "Available to everyone.",
+        "lines": [
+            "**/poll** — Create a poll with up to 5 options. Live results, ends automatically.",
+            "**/suggest** — Post a suggestion with 👍/👎 vote buttons (goes to #suggestions if you have one).",
+            "**/remind** — Set a reminder; I'll DM you when it's time (works in DMs too).",
         ],
     },
     "fun": {
@@ -1282,6 +1316,7 @@ async def end_giveaway(giveaway_id):
     log_embed.add_field(name="Hosted by", value=f"<@{gw['host_id']}>", inline=True)
     log_embed.set_footer(text=f"Giveaway ID: {giveaway_id}")
     await send_log(channel.guild, log_embed)
+    await archive_giveaway(giveaway_id, gw, chosen)  # kept 30 days so /reroll works
     delete_giveaway_doc(giveaway_id)
     # finished giveaways are dropped from memory so the dict (scanned on every message) stays small
     giveaways.pop(giveaway_id, None)
@@ -1520,7 +1555,7 @@ JAIL_MAX_SECONDS = 30 * 86400
 DEFAULT_USER = {
     "coins": 0, "last_daily": 0.0, "streak": 0, "last_work": 0.0, "trivia_points": 0,
     "jailed_until": None, "jail_role_id": None, "boost_multiplier": 1, "boost_until": 0.0,
-    "boost_name": None, "warnings": [],
+    "boost_name": None, "warnings": [], "last_rob": 0.0,
 }
 
 SHOP_ITEMS = [
@@ -1798,12 +1833,17 @@ async def work_cmd(ctx):
 
 
 class ShopView(discord.ui.View):
-    def __init__(self, guild_id, user_id):
+    def __init__(self, guild_id, user_id, guild=None):
         super().__init__(timeout=60)
         self.guild_id = guild_id
         self.user_id = user_id
         for item in SHOP_ITEMS:
             self.add_item(ShopBuyButton(item))
+        if guild is not None:
+            for rid, price in list(shop_roles.get(guild_id, {}).items())[:10]:
+                role = guild.get_role(rid)
+                if role:
+                    self.add_item(ShopRoleButton(role, price))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -1857,8 +1897,12 @@ async def shop_cmd(ctx):
         embed.add_field(name=f"{item['name']} — {item['price']:,} {COIN}", value=item["desc"], inline=False)
     if active_multiplier(u) > 1:
         embed.add_field(name="Currently active", value=f"{u.get('boost_name')} — ends {fmt_ts(u['boost_until'])}", inline=False)
+    for rid, price in list(shop_roles.get(ctx.guild.id, {}).items())[:10]:
+        shop_role = ctx.guild.get_role(rid)
+        if shop_role:
+            embed.add_field(name=f"{shop_role.name} (role) — {price:,} {COIN}", value="A cosmetic role you keep.", inline=False)
     embed.set_footer(text="Buying a new boost replaces any boost currently active • ChillBot 😎")
-    await ctx.send(embed=embed, view=ShopView(ctx.guild.id, ctx.author.id))
+    await ctx.send(embed=embed, view=ShopView(ctx.guild.id, ctx.author.id, ctx.guild))
 
 
 @bot.hybrid_command(name="give-coins", description="[Owner only] Give yourself coins")
@@ -3893,6 +3937,11 @@ async def on_message(message):
         if message.guild and await run_automod(message):
             return
 
+        if message.guild:
+            auto_cfg = auto_channels.get(message.guild.id, {}).get(message.channel.id)
+            if auto_cfg:
+                handle_auto_channel(message, auto_cfg)
+
         if bot.user in message.mentions:
             await handle_mention(message)
             return
@@ -3922,28 +3971,1247 @@ async def on_message(message):
         print(f"on_message error: {e}", flush=True)
 
 
+# =====================================================================
+# v1.5 FEATURES: /reroll, /poll, tickets, role menus, /pay, /blackjack, /rob,
+# shop roles, /suggest, /autochannel, /remind
+# =====================================================================
+
+async def db_call(fn, default=None):
+    """Runs a blocking MongoDB call in a thread with a timeout. Returns `default` if it fails."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(fn), timeout=8)
+    except Exception as e:
+        print(f"DB error: {e}", flush=True)
+        return default
+
+
+RISKY_PERMISSION_NAMES = (
+    "administrator", "manage_guild", "manage_roles", "manage_channels", "manage_messages",
+    "kick_members", "ban_members", "moderate_members", "mention_everyone", "manage_webhooks",
+)
+
+
+def role_is_risky(role: discord.Role):
+    """Roles with moderator-level powers must never be sold in the shop or handed out by a menu."""
+    perms = role.permissions
+    return any(getattr(perms, name, False) for name in RISKY_PERMISSION_NAMES)
+
+
+# ---------------------------------------------------------------------
+# /reroll
+# ---------------------------------------------------------------------
+
+async def archive_giveaway(gid, gw, winner_ids):
+    """Keeps a compact copy of an ended giveaway (entry counts only) for 30 days so /reroll works."""
+    counts = {}
+    for uid in gw["entries"]:
+        counts[str(uid)] = counts.get(str(uid), 0) + 1
+    doc = {
+        "_id": gid, "guild_id": gw["guild_id"], "channel_id": gw["channel_id"], "host_id": gw["host_id"],
+        "prize": gw["prize"], "entries": counts, "winners": list(winner_ids),
+        "ended_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+    await db_call(lambda: ended_col.replace_one({"_id": gid}, doc, upsert=True))
+
+
+@bot.hybrid_command(name="reroll", description="Pick a new winner for a giveaway that already ended")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(message_id="The giveaway's ID, shown in small text at the bottom of the giveaway post", winners="How many new winners to pick (default: 1)")
+async def reroll_cmd(ctx, message_id: str, winners: typing.Optional[int] = 1):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not can_manage_giveaways(ctx.author):
+        await ctx.send("You don't have permission to reroll giveaways.", ephemeral=True)
+        return
+    try:
+        gid = int(message_id)
+    except ValueError:
+        await ctx.send("That doesn't look like a valid giveaway ID.", ephemeral=True)
+        return
+    if winners is None or winners < 1 or winners > 20:
+        await ctx.send("Winners must be between 1 and 20.", ephemeral=True)
+        return
+
+    await ctx.defer(ephemeral=True)
+    doc = await db_call(lambda: ended_col.find_one({"_id": gid}))
+    if not doc or doc.get("guild_id") != ctx.guild.id:
+        await ctx.send("I can't find an ended giveaway with that ID. Rerolls only work for giveaways that ended on v1.5 or later, within the last 30 days.", ephemeral=True)
+        return
+
+    previous = set(doc.get("winners", []))
+    pool = []
+    for uid_str, count in doc.get("entries", {}).items():
+        uid = int(uid_str)
+        if uid in previous or ctx.guild.get_member(uid) is None:
+            continue  # skip earlier winners and people who left the server
+        pool.extend([uid] * count)
+    if not pool:
+        await ctx.send("There's nobody eligible left to reroll — everyone else has already won or left the server.", ephemeral=True)
+        return
+
+    chosen = []
+    for _ in range(min(winners, len(set(pool)))):
+        pick = random.choice(pool)
+        chosen.append(pick)
+        pool = [uid for uid in pool if uid != pick]
+        record_win(ctx.guild.id, pick)
+
+    new_winners = list(previous) + chosen
+    await db_call(lambda: ended_col.update_one({"_id": gid}, {"$set": {"winners": new_winners}}))
+
+    winners_text = "\n".join(f"🏆 <@{uid}>" for uid in chosen)
+    embed = discord.Embed(
+        title="🎉 Giveaway Rerolled!",
+        description=f"**Prize:** {doc['prize']}\n\n**New winner(s):**\n{winners_text}\n\nCongratulations! 🎊",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="🔁 Rerolled by", value=ctx.author.mention, inline=True)
+    embed.set_footer(text=f"Giveaway ID: {gid} • ChillBot 😎")
+    channel = ctx.guild.get_channel(doc["channel_id"]) or ctx.channel
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print(f"Reroll announce error: {e}", flush=True)
+        await ctx.send("I picked a winner but couldn't post in the giveaway channel.", ephemeral=True)
+        return
+    await ctx.send("✅ Rerolled.", ephemeral=True)
+    log_embed = discord.Embed(title="🔁 Giveaway Rerolled", description=f"{ctx.author.mention} rerolled a giveaway.\n{winners_text}", color=discord.Color.orange())
+    log_embed.set_footer(text=f"Giveaway ID: {gid}")
+    await send_log(ctx.guild, log_embed)
+
+
+# ---------------------------------------------------------------------
+# /poll (buttons, live results, auto-ends, survives restarts)
+# ---------------------------------------------------------------------
+
+active_polls = {}  # message_id -> poll dict
+POLL_MIN_SECONDS = 60
+POLL_MAX_SECONDS = 7 * 86400
+POLL_MAX_ACTIVE_PER_USER = 3
+
+
+def poll_embed(poll, ended=False):
+    options = poll["options"]
+    counts = [0] * len(options)
+    for idx in poll["votes"].values():
+        if 0 <= idx < len(counts):
+            counts[idx] += 1
+    total = sum(counts)
+    lines = []
+    for i, opt in enumerate(options):
+        pct = (counts[i] / total * 100) if total else 0
+        filled = round(pct / 10)
+        lines.append(f"**{i + 1}. {opt}**\n{'█' * filled}{'░' * (10 - filled)} **{counts[i]}** ({pct:.0f}%)")
+    embed = discord.Embed(
+        title=f"📊 {poll['question']}",
+        description="\n\n".join(lines),
+        color=discord.Color.green() if ended else DEFAULT_COLOR
+    )
+    if ended:
+        if total:
+            top = max(counts)
+            winners = [options[i] for i, c in enumerate(counts) if c == top]
+            embed.add_field(name="🏁 Result", value=("Tie: " if len(winners) > 1 else "Winner: ") + ", ".join(f"**{w}**" for w in winners), inline=False)
+        else:
+            embed.add_field(name="🏁 Result", value="Nobody voted.", inline=False)
+    else:
+        embed.add_field(name="⏰ Ends", value=fmt_ts(poll["end_ts"]), inline=True)
+    embed.set_footer(text=f"{total} vote{'s' if total != 1 else ''} • Started by {poll['author_name']} • Click your choice again to remove your vote")
+    return embed
+
+
+async def save_poll(pid):
+    poll = active_polls.get(pid)
+    if not poll:
+        return
+    doc = dict(poll)
+    doc["_id"] = pid
+    await db_call(lambda: polls_col.replace_one({"_id": pid}, doc, upsert=True))
+
+
+class PollButton(discord.ui.Button):
+    def __init__(self, index, label=None):
+        super().__init__(label=label or f"Option {index + 1}", style=discord.ButtonStyle.primary, custom_id=f"poll_opt_{index}")
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        pid = interaction.message.id
+        poll = active_polls.get(pid)
+        if not poll or not poll["active"]:
+            await interaction.response.send_message("This poll has ended.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        if poll["votes"].get(uid) == self.index:
+            del poll["votes"][uid]
+            note = "Your vote was removed."
+        else:
+            poll["votes"][uid] = self.index
+            note = f"You voted for **{poll['options'][self.index]}**."
+        await interaction.response.edit_message(embed=poll_embed(poll))
+        await interaction.followup.send(note, ephemeral=True)
+        await save_poll(pid)
+
+
+class PollView(discord.ui.View):
+    """With `options` it builds a real poll's buttons; with none it's the generic copy registered at
+    startup so buttons on old poll messages keep working after a restart."""
+    def __init__(self, options=None, disabled=False):
+        super().__init__(timeout=None)
+        labels = [f"{i + 1}. {o[:30]}" for i, o in enumerate(options)] if options else [None] * 5
+        for i, label in enumerate(labels):
+            button = PollButton(i, label)
+            button.disabled = disabled
+            self.add_item(button)
+
+
+async def end_poll(pid):
+    poll = active_polls.get(pid)
+    if not poll or not poll["active"]:
+        return
+    poll["active"] = False
+    await save_poll(pid)
+    channel = bot.get_channel(poll["channel_id"])
+    if channel:
+        try:
+            msg = await channel.fetch_message(pid)
+            await msg.edit(embed=poll_embed(poll, ended=True), view=PollView(poll["options"], disabled=True))
+        except Exception as e:
+            print(f"End poll edit error: {e}", flush=True)
+    active_polls.pop(pid, None)
+
+
+async def poll_timer(pid):
+    poll = active_polls.get(pid)
+    if not poll:
+        return
+    delay = poll["end_ts"] - time.time()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    await end_poll(pid)
+
+
+@bot.hybrid_command(name="poll", description="Create a poll with up to 5 options")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    question="What are you asking?", option1="First choice", option2="Second choice",
+    option3="Third choice (optional)", option4="Fourth choice (optional)", option5="Fifth choice (optional)",
+    duration="How long it runs, e.g. 30m, 1h, 1d (default 24h, max 7 days)"
+)
+async def poll_cmd(
+    ctx, question: str, option1: str, option2: str,
+    option3: typing.Optional[str] = None, option4: typing.Optional[str] = None, option5: typing.Optional[str] = None,
+    duration: typing.Optional[str] = "24h",
+):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    options = [o.strip() for o in (option1, option2, option3, option4, option5) if o and o.strip()]
+    if len(options) < 2:
+        await ctx.send("A poll needs at least 2 options.", ephemeral=True)
+        return
+    if len(question) > 200 or any(len(o) > 80 for o in options):
+        await ctx.send("Keep the question under 200 characters and each option under 80.", ephemeral=True)
+        return
+    seconds = parse_duration(duration or "24h")
+    if seconds is None or seconds < POLL_MIN_SECONDS or seconds > POLL_MAX_SECONDS:
+        await ctx.send("Duration must be between 1 minute and 7 days, e.g. `30m`, `1h`, `2d`.", ephemeral=True)
+        return
+    mine = sum(1 for p in active_polls.values() if p["author_id"] == ctx.author.id and p["guild_id"] == ctx.guild.id)
+    if mine >= POLL_MAX_ACTIVE_PER_USER:
+        await ctx.send(f"You already have {POLL_MAX_ACTIVE_PER_USER} polls running — wait for one to finish.", ephemeral=True)
+        return
+
+    poll = {
+        "question": question, "options": options, "votes": {}, "channel_id": ctx.channel.id,
+        "guild_id": ctx.guild.id, "author_id": ctx.author.id, "author_name": ctx.author.display_name,
+        "end_ts": time.time() + seconds, "active": True,
+    }
+    try:
+        msg = await ctx.channel.send(embed=poll_embed(poll), view=PollView(options))
+    except discord.Forbidden:
+        await ctx.send("I can't send messages in this channel.", ephemeral=True)
+        return
+    active_polls[msg.id] = poll
+    await save_poll(msg.id)
+    asyncio.create_task(poll_timer(msg.id))
+    await ctx.send("✅ Poll posted.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# Tickets
+# ---------------------------------------------------------------------
+
+TICKET_CATEGORY_NAME = "🎫 Tickets"
+
+
+def staff_role_objects(guild):
+    return [r for r in (guild.get_role(rid) for rid in staff_roles.get(guild.id, set())) if r]
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open a ticket", emoji="🎫", style=discord.ButtonStyle.green, custom_id="ticket_open")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        if guild is None:
+            return
+        user = interaction.user
+        marker = f"ticket:{user.id}"
+        for ch in guild.text_channels:
+            if (ch.topic or "").split()[:1] == [marker]:
+                await interaction.response.send_message(f"You already have an open ticket: {ch.mention}", ephemeral=True)
+                return
+        await interaction.response.defer(ephemeral=True)
+
+        me = guild.me
+        staff = staff_role_objects(guild)
+        PO = discord.PermissionOverwrite
+        base = {
+            guild.default_role: PO(view_channel=False),
+            me: PO(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True, embed_links=True, attach_files=True),
+        }
+        for role in staff:
+            base[role] = PO(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+        channel_overwrites = dict(base)
+        channel_overwrites[user] = PO(view_channel=True, send_messages=True, read_message_history=True, attach_files=True)
+
+        safe_name = "".join(c for c in user.name.lower() if c.isalnum() or c == "-")[:20] or "user"
+        try:
+            category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+            if category is None:
+                category = await guild.create_category(TICKET_CATEGORY_NAME, overwrites=base)
+            channel = await guild.create_text_channel(
+                f"ticket-{safe_name}", category=category, overwrites=channel_overwrites,
+                topic=f"{marker} • opened by {user}", reason=f"Ticket opened by {user}"
+            )
+        except discord.Forbidden:
+            await interaction.followup.send("I couldn't create the ticket — I need the **Manage Channels** permission.", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            print(f"Ticket create error: {e}", flush=True)
+            await interaction.followup.send("I couldn't create the ticket (the Tickets category may be full). Please tell a moderator.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🎫 Ticket opened",
+            description=f"Hi {user.mention}! Tell us what you need and a staff member will be with you shortly.\n\nPress **Close ticket** when you're done.",
+            color=get_guild_color(guild.id)
+        )
+        embed.set_footer(text="ChillBot 😎")
+        pings = " ".join([user.mention] + [r.mention for r in staff])
+        await channel.send(content=pings, embed=embed, view=TicketCloseView(),
+                           allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        await interaction.followup.send(f"✅ Your ticket is ready: {channel.mention}", ephemeral=True)
+
+        log_embed = discord.Embed(title="🎫 Ticket Opened", description=f"{user.mention} opened {channel.mention}", color=discord.Color.blurple())
+        await send_log(guild, log_embed)
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close ticket", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        topic = getattr(channel, "topic", None) or ""
+        if not topic.startswith("ticket:"):
+            await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+            return
+        try:
+            opener_id = int(topic.split()[0].split(":")[1])
+        except (ValueError, IndexError):
+            opener_id = 0
+        if interaction.user.id != opener_id and not can_moderate(interaction.user):
+            await interaction.response.send_message("Only the ticket owner or staff can close this ticket.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        guild = interaction.guild
+
+        lines = []
+        try:
+            async for m in channel.history(limit=500, oldest_first=True):
+                stamp = m.created_at.strftime("%Y-%m-%d %H:%M")
+                text = m.content or ""
+                if m.attachments:
+                    text += " " + " ".join(a.url for a in m.attachments)
+                lines.append(f"[{stamp}] {m.author} ({m.author.id}): {text}")
+        except Exception as e:
+            print(f"Ticket transcript error: {e}", flush=True)
+
+        log_id = log_channels.get(guild.id)
+        log_channel = guild.get_channel(log_id) if log_id else None
+        if log_channel:
+            embed = discord.Embed(
+                title="🔒 Ticket Closed",
+                description=f"**{channel.name}** (opened by <@{opener_id}>) was closed by {interaction.user.mention}.",
+                color=discord.Color.orange()
+            )
+            try:
+                data = "\n".join(lines) or "(no messages)"
+                await log_channel.send(embed=embed, file=discord.File(io.BytesIO(data.encode("utf-8")), filename=f"{channel.name}-transcript.txt"))
+            except Exception as e:
+                print(f"Ticket log error: {e}", flush=True)
+
+        await asyncio.sleep(5)
+        try:
+            await channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception as e:
+            print(f"Ticket delete error: {e}", flush=True)
+
+
+@bot.hybrid_command(name="ticketsetup", description="[Admin] Post a ticket panel with an 'Open a ticket' button")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(channel="Where to post the panel (default: this channel)", description="Text shown on the panel")
+async def ticketsetup_cmd(ctx, channel: typing.Optional[discord.TextChannel] = None, description: typing.Optional[str] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.", ephemeral=True)
+        return
+    me = ctx.guild.me
+    if not me.guild_permissions.manage_channels:
+        await ctx.send("I need the **Manage Channels** permission to create tickets.", ephemeral=True)
+        return
+    target = channel or ctx.channel
+    embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description=(description or "Need help or want to talk to the staff privately? Press the button below and a private channel will be created for you.")[:1500],
+        color=get_guild_color(ctx.guild.id)
+    )
+    embed.set_footer(text="ChillBot 😎")
+    try:
+        await target.send(embed=embed, view=TicketPanelView())
+    except discord.Forbidden:
+        await ctx.send("I can't send messages in that channel.", ephemeral=True)
+        return
+    note = f"✅ Ticket panel posted in {target.mention}."
+    if not staff_roles.get(ctx.guild.id):
+        note += "\n💡 No staff roles are set yet, so only admins can see tickets. Add your moderator roles with **/staffsetup** and they'll be added to every new ticket."
+    await ctx.send(note, ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# Role menu (dropdown self-roles)
+# ---------------------------------------------------------------------
+
+class RoleMenuSelect(discord.ui.Select):
+    def __init__(self, options=None):
+        if not options:
+            options = [discord.SelectOption(label="Roles", value="0")]  # placeholder for the startup copy
+        super().__init__(custom_id="rolemenu_select", placeholder="Pick your roles...", min_values=0, max_values=len(options), options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return
+        # the menu's roles are read from the message itself, so no database is needed
+        menu_ids = set()
+        for row in interaction.message.components:
+            for child in getattr(row, "children", []):
+                if getattr(child, "custom_id", None) == "rolemenu_select":
+                    menu_ids |= {int(o.value) for o in child.options}
+        chosen = {int(v) for v in self.values}
+
+        to_add, to_remove = [], []
+        for rid in menu_ids:
+            role = guild.get_role(rid)
+            if role is None or role_is_risky(role) or role.managed or role >= guild.me.top_role:
+                continue
+            if rid in chosen and role not in member.roles:
+                to_add.append(role)
+            elif rid not in chosen and role in member.roles:
+                to_remove.append(role)
+        try:
+            if to_add:
+                await member.add_roles(*to_add, reason="Role menu")
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Role menu")
+        except discord.Forbidden:
+            await interaction.response.send_message("I can't manage those roles — a moderator needs to move my role above them.", ephemeral=True)
+            return
+        parts = []
+        if to_add:
+            parts.append("✅ Added: " + ", ".join(r.mention for r in to_add))
+        if to_remove:
+            parts.append("❌ Removed: " + ", ".join(r.mention for r in to_remove))
+        await interaction.response.send_message("\n".join(parts) or "No changes.", ephemeral=True)
+
+
+class RoleMenuView(discord.ui.View):
+    def __init__(self, options=None):
+        super().__init__(timeout=None)
+        self.add_item(RoleMenuSelect(options))
+
+
+@bot.hybrid_command(name="rolemenu", description="[Admin] Post a dropdown menu so members can pick their own roles")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    title="Title of the menu", role1="First role", role2="Second role (optional)", role3="Third role (optional)",
+    role4="Fourth role (optional)", role5="Fifth role (optional)", description="Text shown above the menu"
+)
+async def rolemenu_cmd(
+    ctx, title: str, role1: discord.Role, role2: typing.Optional[discord.Role] = None,
+    role3: typing.Optional[discord.Role] = None, role4: typing.Optional[discord.Role] = None,
+    role5: typing.Optional[discord.Role] = None, description: typing.Optional[str] = None,
+):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.", ephemeral=True)
+        return
+    roles = []
+    for r in (role1, role2, role3, role4, role5):
+        if r and r not in roles:
+            roles.append(r)
+    for r in roles:
+        if r.is_default() or r.managed:
+            await ctx.send(f"{r.mention} can't be used (it's @everyone or a bot/integration role).", ephemeral=True)
+            return
+        if role_is_risky(r):
+            await ctx.send(f"{r.mention} has moderator-level permissions, so I won't hand it out through a menu.", ephemeral=True)
+            return
+        if r >= ctx.guild.me.top_role:
+            await ctx.send(f"I can't give {r.mention} — drag my role above it in Server Settings → Roles first.", ephemeral=True)
+            return
+    options = [discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles]
+    embed = discord.Embed(
+        title=title[:256],
+        description=(description or "Pick the roles you want from the menu below. Deselect a role to remove it.")[:1500],
+        color=get_guild_color(ctx.guild.id)
+    )
+    embed.set_footer(text="ChillBot 😎")
+    try:
+        await ctx.channel.send(embed=embed, view=RoleMenuView(options))
+    except discord.Forbidden:
+        await ctx.send("I can't send messages in this channel.", ephemeral=True)
+        return
+    await ctx.send("✅ Role menu posted.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# Economy: /pay, /blackjack, /rob
+# ---------------------------------------------------------------------
+
+@bot.hybrid_command(name="pay", description="Send some of your coins to another member")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to pay", amount="How many coins to send")
+async def pay_cmd(ctx, member: discord.Member, amount: int):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if member.bot:
+        await ctx.send("Bots don't have wallets 🤖", ephemeral=True)
+        return
+    if member.id == ctx.author.id:
+        await ctx.send("You can't pay yourself!", ephemeral=True)
+        return
+    if amount < 1:
+        await ctx.send("Amount must be at least 1.", ephemeral=True)
+        return
+    sender = get_user(ctx.guild.id, ctx.author.id)
+    if sender["coins"] < amount:
+        await ctx.send(f"You only have **{sender['coins']:,}** {COIN}.", ephemeral=True)
+        return
+    receiver = get_user(ctx.guild.id, member.id)
+    sender["coins"] -= amount
+    receiver["coins"] += amount
+    mark_dirty(ctx.guild.id, ctx.author.id)
+    mark_dirty(ctx.guild.id, member.id)
+    embed = discord.Embed(
+        title="💸 Payment sent",
+        description=f"{ctx.author.mention} sent **{amount:,}** {COIN} to {member.mention}.\n\n**Your balance:** {sender['coins']:,} {COIN}",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="ChillBot 😎")
+    await ctx.send(embed=embed)
+
+
+BJ_MIN_BET = 10
+BJ_MAX_BET = 5000
+BJ_COOLDOWN = 30
+BJ_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+BJ_SUITS = ["♠️", "♥️", "♦️", "♣️"]
+bj_active = set()  # (guild_id, user_id) with a game in progress
+bj_last = {}       # (guild_id, user_id) -> time the last game started
+
+
+def bj_value(hand):
+    total, aces = 0, 0
+    for rank, _ in hand:
+        if rank == "A":
+            aces += 1
+            total += 11
+        elif rank in ("J", "Q", "K"):
+            total += 10
+        else:
+            total += int(rank)
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def bj_fmt(hand, hide_second=False):
+    if hide_second:
+        return f"`{hand[0][0]}{hand[0][1]}` `❓`"
+    return " ".join(f"`{r}{s}`" for r, s in hand)
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, player_id, guild_id, bet):
+        super().__init__(timeout=60)
+        self.player_id = player_id
+        self.guild_id = guild_id
+        self.bet = bet
+        self.deck = [(r, s) for r in BJ_RANKS for s in BJ_SUITS]
+        random.shuffle(self.deck)
+        self.player = [self.deck.pop(), self.deck.pop()]
+        self.dealer = [self.deck.pop(), self.deck.pop()]
+        self.finished = False
+        self.first_move = True
+        self.message = None
+        self.update_buttons()
+
+    def update_buttons(self):
+        u = get_user(self.guild_id, self.player_id)
+        self.double_button.disabled = not self.first_move or u["coins"] < self.bet
+
+    def build_embed(self, reveal=False, result=None, color=DEFAULT_COLOR):
+        embed = discord.Embed(title="🃏 Blackjack", color=color)
+        embed.add_field(name=f"Your hand ({bj_value(self.player)})", value=bj_fmt(self.player), inline=False)
+        if reveal:
+            embed.add_field(name=f"Dealer ({bj_value(self.dealer)})", value=bj_fmt(self.dealer), inline=False)
+        else:
+            embed.add_field(name="Dealer", value=bj_fmt(self.dealer, hide_second=True), inline=False)
+        embed.add_field(name="Bet", value=f"{self.bet:,} {COIN}", inline=True)
+        if result:
+            embed.add_field(name="Result", value=result, inline=False)
+        embed.set_footer(text="Dealer stands on 17 • Blackjack pays 3:2 • ChillBot 😎")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message("This isn't your game — start one with `/blackjack`!", ephemeral=True)
+            return False
+        return True
+
+    async def settle(self, interaction=None):
+        if self.finished:
+            return
+        self.finished = True
+        bj_active.discard((self.guild_id, self.player_id))
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+
+        pv = bj_value(self.player)
+        if pv <= 21:
+            while bj_value(self.dealer) < 17:
+                self.dealer.append(self.deck.pop())
+        dv = bj_value(self.dealer)
+        player_natural = len(self.player) == 2 and pv == 21
+        dealer_natural = len(self.dealer) == 2 and dv == 21
+
+        if pv > 21:
+            payout, text, color = 0, "💥 **Bust!** You lose.", discord.Color.red()
+        elif player_natural and dealer_natural:
+            payout, text, color = self.bet, "🤝 Both have blackjack — **push**.", discord.Color.orange()
+        elif player_natural:
+            payout, text, color = int(self.bet * 2.5), "🎉 **Blackjack!** Pays 3:2.", discord.Color.green()
+        elif dealer_natural:
+            payout, text, color = 0, "😬 Dealer has **blackjack**. You lose.", discord.Color.red()
+        elif dv > 21:
+            payout, text, color = self.bet * 2, "🎉 **Dealer busts!** You win.", discord.Color.green()
+        elif pv > dv:
+            payout, text, color = self.bet * 2, "🎉 **You win!**", discord.Color.green()
+        elif pv == dv:
+            payout, text, color = self.bet, "🤝 **Push** — your bet is returned.", discord.Color.orange()
+        else:
+            payout, text, color = 0, "😢 **Dealer wins.**", discord.Color.red()
+
+        u = get_user(self.guild_id, self.player_id)
+        u["coins"] += payout
+        mark_dirty(self.guild_id, self.player_id)
+        net = payout - self.bet
+        sign = "+" if net > 0 else ""
+        text += f"\n**{sign}{net:,}** {COIN} • Balance: **{u['coins']:,}** {COIN}"
+        embed = self.build_embed(reveal=True, result=text, color=color)
+        try:
+            if interaction is not None:
+                await interaction.response.edit_message(embed=embed, view=self)
+            elif self.message is not None:
+                await self.message.edit(embed=embed, view=self)
+        except Exception as e:
+            print(f"Blackjack settle edit error: {e}", flush=True)
+
+    async def on_timeout(self):
+        if not self.finished:
+            await self.settle(None)  # no answer = stand
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.green)
+    async def hit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.first_move = False
+        self.player.append(self.deck.pop())
+        if bj_value(self.player) >= 21:
+            await self.settle(interaction)
+            return
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+    async def stand_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.settle(interaction)
+
+    @discord.ui.button(label="Double down", style=discord.ButtonStyle.blurple)
+    async def double_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        u = get_user(self.guild_id, self.player_id)
+        if not self.first_move or u["coins"] < self.bet:
+            await interaction.response.send_message("You can't double down right now.", ephemeral=True)
+            return
+        u["coins"] -= self.bet
+        self.bet *= 2
+        mark_dirty(self.guild_id, self.player_id)
+        self.first_move = False
+        self.player.append(self.deck.pop())
+        await self.settle(interaction)
+
+
+@bot.hybrid_command(name="blackjack", description="Bet coins in a game of blackjack against ChillBot")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(bet=f"How many coins to bet ({BJ_MIN_BET}-{BJ_MAX_BET})")
+async def blackjack_cmd(ctx, bet: int):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    key = (ctx.guild.id, ctx.author.id)
+    if key in bj_active:
+        await ctx.send("You already have a blackjack game running — finish it first!", ephemeral=True)
+        return
+    wait = BJ_COOLDOWN - (time.time() - bj_last.get(key, 0))
+    if wait > 0:
+        await ctx.send(f"⏳ Slow down! You can play again in **{int(wait) + 1}s**.", ephemeral=True)
+        return
+    if bet < BJ_MIN_BET or bet > BJ_MAX_BET:
+        await ctx.send(f"Bets must be between **{BJ_MIN_BET}** and **{BJ_MAX_BET:,}** {COIN}.", ephemeral=True)
+        return
+    u = get_user(ctx.guild.id, ctx.author.id)
+    if u["coins"] < bet:
+        await ctx.send(f"You only have **{u['coins']:,}** {COIN}.", ephemeral=True)
+        return
+
+    u["coins"] -= bet
+    mark_dirty(ctx.guild.id, ctx.author.id)
+    bj_active.add(key)
+    bj_last[key] = time.time()
+    view = BlackjackView(ctx.author.id, ctx.guild.id, bet)
+    try:
+        view.message = await ctx.send(embed=view.build_embed(), view=view)
+    except Exception as e:
+        print(f"Blackjack send error: {e}", flush=True)
+        u["coins"] += bet  # refund — the game never started
+        mark_dirty(ctx.guild.id, ctx.author.id)
+        bj_active.discard(key)
+        return
+    if bj_value(view.player) == 21 or bj_value(view.dealer) == 21:
+        await view.settle()
+
+
+ROB_COOLDOWN = 3600
+ROB_MIN_COINS = 100
+ROB_SUCCESS_CHANCE = 0.45
+ROB_JAIL_CHANCE = 0.5
+ROB_JAIL_SECONDS = 300
+
+
+async def quick_jail(guild, member, seconds, reason):
+    """Jails someone using the server's jailed role. Returns False if that isn't possible."""
+    role_id = jail_roles.get(guild.id)
+    role = guild.get_role(role_id) if role_id else None
+    if role is None or role.managed or role >= guild.me.top_role:
+        return False
+    try:
+        await member.add_roles(role, reason=reason)
+    except Exception as e:
+        print(f"Quick jail error: {e}", flush=True)
+        return False
+    until = time.time() + seconds
+    u = get_user(guild.id, member.id)
+    u["jailed_until"] = until
+    u["jail_role_id"] = role.id
+    mark_dirty(guild.id, member.id)
+    schedule_jail_release(guild.id, member.id, until)
+    return True
+
+
+@bot.hybrid_command(name="rob", description="Try to steal coins from another member (risky — you might get jailed!)")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(member="Who to rob")
+async def rob_cmd(ctx, member: discord.Member):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if member.bot:
+        await ctx.send("Bots don't carry cash 🤖", ephemeral=True)
+        return
+    if member.id == ctx.author.id:
+        await ctx.send("You can't rob yourself!", ephemeral=True)
+        return
+
+    now = time.time()
+    robber = get_user(ctx.guild.id, ctx.author.id)
+    victim = get_user(ctx.guild.id, member.id)
+    if robber.get("jailed_until") and robber["jailed_until"] > now:
+        await ctx.send("You're in jail — you can't rob anyone right now!", ephemeral=True)
+        return
+    if now - robber["last_rob"] < ROB_COOLDOWN:
+        await ctx.send(f"🕵️ You're laying low. You can try again {fmt_ts(robber['last_rob'] + ROB_COOLDOWN)}.", ephemeral=True)
+        return
+    if robber["coins"] < ROB_MIN_COINS:
+        await ctx.send(f"You need at least **{ROB_MIN_COINS}** {COIN} to try — you have to be able to pay the fine if you get caught.", ephemeral=True)
+        return
+    if victim["coins"] < ROB_MIN_COINS:
+        await ctx.send(f"{member.mention} doesn't have enough coins to be worth robbing.", ephemeral=True)
+        return
+    if victim.get("jailed_until") and victim["jailed_until"] > now:
+        await ctx.send(f"{member.mention} is in jail — nothing to steal from there.", ephemeral=True)
+        return
+
+    robber["last_rob"] = now
+    if random.random() < ROB_SUCCESS_CHANCE:
+        stolen = max(1, min(int(victim["coins"] * random.uniform(0.10, 0.30)), 2000))
+        victim["coins"] -= stolen
+        robber["coins"] += stolen
+        mark_dirty(ctx.guild.id, ctx.author.id)
+        mark_dirty(ctx.guild.id, member.id)
+        embed = discord.Embed(
+            title="🥷 Heist successful!",
+            description=f"{ctx.author.mention} snuck away with **{stolen:,}** {COIN} from {member.mention}!",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        return
+
+    fine = max(1, min(int(robber["coins"] * random.uniform(0.10, 0.25)), 1000))
+    robber["coins"] -= fine
+    victim["coins"] += fine
+    mark_dirty(ctx.guild.id, ctx.author.id)
+    mark_dirty(ctx.guild.id, member.id)
+    description = f"{ctx.author.mention} got caught trying to rob {member.mention} and paid a **{fine:,}** {COIN} fine (to the victim)."
+    jailed = False
+    if random.random() < ROB_JAIL_CHANCE:
+        jailed = await quick_jail(ctx.guild, ctx.author, ROB_JAIL_SECONDS, "Caught robbing someone")
+    if jailed:
+        description += f"\n🚔 They were also thrown in jail for **{ROB_JAIL_SECONDS // 60} minutes**!"
+    embed = discord.Embed(title="🚨 Caught red-handed!", description=description, color=discord.Color.red())
+    await ctx.send(embed=embed)
+
+
+# ---------------------------------------------------------------------
+# Shop: roles for sale
+# ---------------------------------------------------------------------
+
+class ShopRoleButton(discord.ui.Button):
+    def __init__(self, role, price):
+        super().__init__(label=f"{role.name[:40]} — {price:,} 🪙", style=discord.ButtonStyle.primary)
+        self.role_id = role.id
+        self.price = price
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ShopView = self.view
+        guild = interaction.guild
+        member = interaction.user
+        role = guild.get_role(self.role_id)
+        if role is None:
+            await interaction.response.send_message("That role no longer exists.", ephemeral=True)
+            return
+        if role in member.roles:
+            await interaction.response.send_message("You already own that role!", ephemeral=True)
+            return
+        if role_is_risky(role) or role.managed or role >= guild.me.top_role:
+            await interaction.response.send_message("I can't hand out that role right now — please tell an admin.", ephemeral=True)
+            return
+        u = get_user(view.guild_id, view.user_id)
+        if u["coins"] < self.price:
+            await interaction.response.send_message(f"You need **{self.price:,}** {COIN}, but you only have **{u['coins']:,}** {COIN}.", ephemeral=True)
+            return
+        u["coins"] -= self.price
+        mark_dirty(view.guild_id, view.user_id)
+        try:
+            await member.add_roles(role, reason="Bought in /shop")
+        except Exception as e:
+            print(f"Shop role error: {e}", flush=True)
+            u["coins"] += self.price  # refund
+            mark_dirty(view.guild_id, view.user_id)
+            await interaction.response.send_message("Something went wrong giving you the role — you weren't charged.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="✅ Purchase complete!",
+            description=f"You bought the {role.mention} role.\n\n**Balance:** {u['coins']:,} {COIN}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.hybrid_command(name="shoprole", description="[Admin] Sell a cosmetic role in /shop for coins")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(action="What to do", role="The role to sell or stop selling", price="Price in coins (for add)")
+async def shoprole_cmd(ctx, action: typing.Literal["add", "remove", "list"], role: typing.Optional[discord.Role] = None, price: typing.Optional[int] = None):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.", ephemeral=True)
+        return
+    guild_id = ctx.guild.id
+    items = shop_roles.setdefault(guild_id, {})
+
+    if action == "list":
+        if not items:
+            await ctx.send("No roles are for sale yet. Add one with `/shoprole add`.", ephemeral=True)
+            return
+        lines = [f"<@&{rid}> — **{p:,}** {COIN}" for rid, p in items.items()]
+        await ctx.send("**Roles for sale:**\n" + "\n".join(lines), ephemeral=True)
+        return
+
+    if role is None:
+        await ctx.send("Please pick a role.", ephemeral=True)
+        return
+    if action == "remove":
+        if items.pop(role.id, None) is None:
+            await ctx.send("That role isn't for sale.", ephemeral=True)
+            return
+        save_settings(guild_id)
+        await ctx.send(f"❌ {role.mention} is no longer for sale.", ephemeral=True)
+        return
+
+    # add
+    if price is None or price < 1 or price > 10_000_000:
+        await ctx.send("Please give a price between 1 and 10,000,000.", ephemeral=True)
+        return
+    if role.is_default() or role.managed:
+        await ctx.send("That role can't be sold (it's @everyone or a bot/integration role).", ephemeral=True)
+        return
+    if role_is_risky(role):
+        await ctx.send("That role has moderator-level permissions, so I won't sell it in the shop.", ephemeral=True)
+        return
+    if role.id not in items and len(items) >= 10:
+        await ctx.send("You can sell at most 10 roles. Remove one first.", ephemeral=True)
+        return
+    items[role.id] = price
+    save_settings(guild_id)
+    note = f"✅ {role.mention} is now for sale for **{price:,}** {COIN} in `/shop`."
+    if role >= ctx.guild.me.top_role:
+        note += "\n⚠️ I can't hand this role out yet — drag my role above it in Server Settings → Roles."
+    await ctx.send(note, ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# /suggest
+# ---------------------------------------------------------------------
+
+suggestion_cache = {}  # message_id -> {"up": [...], "down": [...]}
+
+
+class SuggestionView(discord.ui.View):
+    def __init__(self, up=0, down=0):
+        super().__init__(timeout=None)
+        self.up_button.label = str(up)
+        self.down_button.label = str(down)
+
+    async def vote(self, interaction: discord.Interaction, side: str):
+        await interaction.response.defer()
+        mid = interaction.message.id
+        data = suggestion_cache.get(mid)
+        if data is None:
+            data = await db_call(lambda: suggestions_col.find_one({"_id": mid})) or {"_id": mid, "up": [], "down": []}
+            suggestion_cache[mid] = data
+        other = "down" if side == "up" else "up"
+        uid = interaction.user.id
+        if uid in data[side]:
+            data[side].remove(uid)
+        else:
+            data[side].append(uid)
+            if uid in data[other]:
+                data[other].remove(uid)
+        await interaction.edit_original_response(view=SuggestionView(len(data["up"]), len(data["down"])))
+        await db_call(lambda: suggestions_col.replace_one({"_id": mid}, data, upsert=True))
+
+    @discord.ui.button(label="0", emoji="👍", style=discord.ButtonStyle.green, custom_id="sug_up")
+    async def up_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.vote(interaction, "up")
+
+    @discord.ui.button(label="0", emoji="👎", style=discord.ButtonStyle.red, custom_id="sug_down")
+    async def down_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.vote(interaction, "down")
+
+
+@bot.hybrid_command(name="suggest", description="Post a suggestion for everyone to vote on")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(idea="Your suggestion")
+async def suggest_cmd(ctx, *, idea: str):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if len(idea) > 1000:
+        await ctx.send("Suggestions can be at most 1000 characters.", ephemeral=True)
+        return
+    # posts in a channel called #suggestions if the server has one, otherwise where it was used
+    target = discord.utils.get(ctx.guild.text_channels, name="suggestions") or ctx.channel
+    embed = discord.Embed(title="💡 Suggestion", description=idea, color=DEFAULT_COLOR)
+    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+    embed.set_footer(text="Vote with the buttons below • ChillBot 😎")
+    try:
+        await target.send(embed=embed, view=SuggestionView())
+    except discord.Forbidden:
+        await ctx.send(f"I can't send messages in {target.mention}.", ephemeral=True)
+        return
+    await ctx.send(f"✅ Your suggestion was posted in {target.mention}.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# /autochannel (auto-thread / auto-delete)
+# ---------------------------------------------------------------------
+
+async def auto_delete_later(message, seconds):
+    await asyncio.sleep(seconds)
+    try:
+        fresh = await message.channel.fetch_message(message.id)
+        if fresh.pinned:
+            return  # pinned messages are kept
+        await fresh.delete()
+    except Exception:
+        pass  # already deleted, or no permission
+
+
+async def auto_make_thread(message):
+    name = " ".join((message.content or "").split())[:80] or f"{message.author.display_name}'s thread"
+    try:
+        await message.create_thread(name=name, auto_archive_duration=1440)
+    except Exception as e:
+        print(f"Auto-thread error: {e}", flush=True)
+
+
+def handle_auto_channel(message, cfg):
+    if cfg["mode"] == "delete":
+        asyncio.create_task(auto_delete_later(message, cfg["seconds"]))
+    elif cfg["mode"] == "thread":
+        asyncio.create_task(auto_make_thread(message))
+
+
+@bot.hybrid_command(name="autochannel", description="[Admin] Auto-thread or auto-delete messages in a channel")
+@app_commands.default_permissions(administrator=True)
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.describe(
+    mode="autothread = every message gets a thread • autodelete = messages vanish after a delay • off • show",
+    channel="The channel (default: this one)", seconds="For autodelete: seconds before a message is deleted (5-86400)"
+)
+async def autochannel_cmd(ctx, mode: typing.Literal["autothread", "autodelete", "off", "show"], channel: typing.Optional[discord.TextChannel] = None, seconds: typing.Optional[int] = 60):
+    if not ctx.guild:
+        await ctx.send("This command only works in servers.")
+        return
+    if not is_admin_or_owner(ctx.author):
+        await ctx.send("This command is for Administrators only.", ephemeral=True)
+        return
+    guild_id = ctx.guild.id
+    target = channel or ctx.channel
+    configs = auto_channels.setdefault(guild_id, {})
+
+    if mode == "show":
+        if not configs:
+            await ctx.send("No auto channels are set up.", ephemeral=True)
+            return
+        lines = []
+        for cid, cfg in configs.items():
+            what = "creates a thread for every message" if cfg["mode"] == "thread" else f"deletes messages after {cfg['seconds']}s"
+            lines.append(f"<#{cid}> — {what}")
+        await ctx.send("\n".join(lines), ephemeral=True)
+        return
+    if mode == "off":
+        if configs.pop(target.id, None) is None:
+            await ctx.send(f"{target.mention} has no auto setting.", ephemeral=True)
+            return
+        save_settings(guild_id)
+        await ctx.send(f"✅ Auto setting removed from {target.mention}.", ephemeral=True)
+        return
+
+    me = ctx.guild.me
+    perms = target.permissions_for(me)
+    if mode == "autothread":
+        if not perms.create_public_threads:
+            await ctx.send(f"I need the **Create Public Threads** permission in {target.mention}.", ephemeral=True)
+            return
+        configs[target.id] = {"mode": "thread", "seconds": 0}
+        note = f"🧵 Every message in {target.mention} will now get its own thread."
+    else:
+        if seconds is None or seconds < 5 or seconds > 86400:
+            await ctx.send("Seconds must be between 5 and 86400.", ephemeral=True)
+            return
+        if not perms.manage_messages:
+            await ctx.send(f"I need the **Manage Messages** permission in {target.mention}.", ephemeral=True)
+            return
+        configs[target.id] = {"mode": "delete", "seconds": seconds}
+        note = f"🗑️ Messages in {target.mention} will be deleted after **{seconds}s** (pinned messages are kept).\nMessages sent while I'm offline or restarting aren't cleaned up."
+    save_settings(guild_id)
+    await ctx.send(note, ephemeral=True)
+
+
+# ---------------------------------------------------------------------
+# /remind
+# ---------------------------------------------------------------------
+
+reminders = []  # list of dicts: id, user_id, channel_id, text, when, created
+MAX_REMINDERS_PER_USER = 25
+
+
+@bot.hybrid_command(name="remind", description="Set a reminder — I'll DM you when it's time")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@app_commands.describe(duration="When to remind you, e.g. 10m, 2h, 1d, 1h30m", message="What to remind you about")
+async def remind_cmd(ctx, duration: str, *, message: str):
+    seconds = parse_duration(duration)
+    if seconds is None or seconds < 30 or seconds > 365 * 86400:
+        await ctx.send("Pick a time between 30 seconds and 1 year, e.g. `10m`, `2h`, `1d`.", ephemeral=True)
+        return
+    if len(message) > 500:
+        await ctx.send("Reminders can be at most 500 characters.", ephemeral=True)
+        return
+    if sum(1 for r in reminders if r["user_id"] == ctx.author.id) >= MAX_REMINDERS_PER_USER:
+        await ctx.send(f"You already have {MAX_REMINDERS_PER_USER} reminders waiting.", ephemeral=True)
+        return
+    now = time.time()
+    reminder = {
+        "id": uuid.uuid4().hex, "user_id": ctx.author.id, "channel_id": ctx.channel.id,
+        "text": message, "when": now + seconds, "created": now,
+    }
+    reminders.append(reminder)
+    doc = dict(reminder)
+    doc["_id"] = doc.pop("id")
+    await db_call(lambda: reminders_col.replace_one({"_id": doc["_id"]}, doc, upsert=True))
+    await ctx.send(f"⏰ Got it! I'll remind you {fmt_ts(reminder['when'])}.", ephemeral=True)
+
+
+async def deliver_reminder(r):
+    embed = discord.Embed(title="⏰ Reminder", description=r["text"], color=DEFAULT_COLOR)
+    embed.add_field(name="You set this", value=fmt_ts(r["created"]), inline=True)
+    embed.set_footer(text="ChillBot 😎")
+    delivered = False
+    try:
+        user = await bot.fetch_user(r["user_id"])
+        await user.send(embed=embed)
+        delivered = True
+    except Exception:
+        pass
+    if not delivered:
+        channel = bot.get_channel(r["channel_id"])
+        if channel:
+            try:
+                await channel.send(content=f"<@{r['user_id']}>", embed=embed, allowed_mentions=discord.AllowedMentions(users=True))
+            except Exception as e:
+                print(f"Reminder delivery failed: {e}", flush=True)
+    await db_call(lambda: reminders_col.delete_one({"_id": r["id"]}))
+
+
+async def reminder_loop():
+    while True:
+        await asyncio.sleep(15)
+        try:
+            now = time.time()
+            for r in [x for x in reminders if x["when"] <= now]:
+                reminders.remove(r)
+                await deliver_reminder(r)
+        except Exception as e:
+            print(f"Reminder loop error: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------
+# Startup loading for the v1.5 features
+# ---------------------------------------------------------------------
+
+v15_loaded = False
+v15_tasks_started = False
+
+
+async def load_v15_data():
+    global v15_loaded
+    if v15_loaded:
+        return
+    v15_loaded = True
+
+    def fetch():
+        try:
+            ended_col.create_index("ended_at", expireAfterSeconds=30 * 86400)  # ended giveaways expire after 30 days
+        except Exception as e:
+            print(f"Index create error: {e}", flush=True)
+        return list(polls_col.find({"active": True})), list(reminders_col.find({}))
+
+    result = await db_call(fetch)
+    if result is None:
+        v15_loaded = False
+        return
+    poll_docs, reminder_docs = result
+    for doc in poll_docs:
+        pid = doc.pop("_id")
+        active_polls[pid] = doc
+        asyncio.create_task(poll_timer(pid))
+    for doc in reminder_docs:
+        doc["id"] = doc.pop("_id")
+        reminders.append(doc)
+    print(f"Loaded {len(poll_docs)} active poll(s) and {len(reminder_docs)} reminder(s).", flush=True)
+
+
+def start_v15_tasks():
+    global v15_tasks_started
+    if v15_tasks_started:
+        return
+    v15_tasks_started = True
+    asyncio.create_task(reminder_loop())
+
+
 bot.add_listener(economy_on_member_join, "on_member_join")
 bot.add_listener(jail_lockdown_new_channel, "on_guild_channel_create")
 
 
-def start_bot():
-    """If Discord/Cloudflare rate-limits this host (error 1015 / HTTP 429), crashing makes Render
-    restart us immediately, and every restart is another login attempt that extends the ban.
-    Instead we wait quietly (the Flask server keeps the service 'healthy'), then restart fresh."""
-    import sys
-    delay = int(os.environ.get("CHILLBOT_BACKOFF", "0") or 0)
-    if delay:
-        print(f"Waiting {delay}s before logging in (previous login was rate limited)...", flush=True)
-        time.sleep(delay)
-    try:
-        bot.run(os.environ["DISCORD_TOKEN"])
-    except discord.HTTPException as e:
-        if e.status != 429:
-            raise
-        next_delay = min(max(delay * 2, 900), 3600)  # 15 min, then 30, then 60 (max)
-        print(f"Discord rate limited this host (HTTP 429 / Cloudflare 1015). Retrying in {next_delay // 60} min.", flush=True)
-        os.environ["CHILLBOT_BACKOFF"] = str(next_delay)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+async def start_bot():
+    """If Discord/Cloudflare rate-limits this host (error 1015 / HTTP 429), we wait inside the SAME
+    process and try again, instead of crashing. Crashing/restarting makes Render relaunch us, and
+    every relaunch is another login attempt that extends the ban. Flask keeps running meanwhile,
+    so Render sees a healthy service and leaves it alone."""
+    token = os.environ["DISCORD_TOKEN"]
+    delay = 900  # 15 min, doubling up to 60 min
+    async with bot:
+        while True:
+            try:
+                await bot.login(token)
+                break
+            except discord.HTTPException as e:
+                if e.status != 429:
+                    raise
+                print(f"Discord rate limited this host (HTTP 429 / Cloudflare 1015). Retrying login in {delay // 60} min.", flush=True)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 3600)
+        await bot.connect(reconnect=True)
 
 
-start_bot()
+asyncio.run(start_bot())
